@@ -152,11 +152,29 @@ function ConnectionIndicator({ readyState }: { readyState: number }) {
   );
 }
 
+interface ScheduledNotification {
+  id: string;
+  message: string;
+  timestamp: string;
+}
+
+function NotificationBubble({ notification }: { notification: ScheduledNotification }) {
+  return (
+    <div style={{ ...styles.messageRow, justifyContent: "flex-start" }}>
+      <div style={styles.notificationBubble}>
+        <div style={styles.notificationLabel}>Scheduled Message</div>
+        <div style={styles.textContent}>{notification.message}</div>
+      </div>
+    </div>
+  );
+}
+
 function ChatInner() {
   const [agentName] = useState(getOrCreateSessionId);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const [inputValue, setInputValue] = useState("");
+  const [notifications, setNotifications] = useState<ScheduledNotification[]>([]);
 
   const agent = useAgent({
     agent: "nano-chat-agent",
@@ -169,9 +187,29 @@ function ChatInner() {
 
   const isStreaming = status === "streaming" || status === "submitted";
 
+  // Listen for custom broadcast notifications from scheduled tasks
+  useEffect(() => {
+    if (!agent) return;
+    const handler = (event: MessageEvent) => {
+      try {
+        const data = JSON.parse(typeof event.data === "string" ? event.data : "");
+        if (data.type === "scheduled-notification") {
+          setNotifications((prev) => [
+            ...prev,
+            { id: data.id, message: data.message, timestamp: data.timestamp },
+          ]);
+        }
+      } catch {
+        // Not JSON or not our message type, ignore
+      }
+    };
+    agent.addEventListener("message", handler);
+    return () => agent.removeEventListener("message", handler);
+  }, [agent]);
+
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+  }, [messages, notifications]);
 
   useEffect(() => {
     inputRef.current?.focus();
@@ -210,6 +248,9 @@ function ChatInner() {
         )}
         {messages.map((message) => (
           <MessageBubble key={message.id} message={message} />
+        ))}
+        {notifications.map((notif) => (
+          <NotificationBubble key={notif.id} notification={notif} />
         ))}
         <div ref={messagesEndRef} />
       </div>
@@ -377,6 +418,25 @@ const styles: Record<string, React.CSSProperties> = {
     whiteSpace: "pre-wrap",
     maxHeight: "200px",
     overflowY: "auto",
+  },
+  notificationBubble: {
+    maxWidth: "85%",
+    padding: "10px 14px",
+    borderRadius: "12px 12px 12px 2px",
+    background: "#1a1a2e",
+    border: "1px solid #2d2d5e",
+    color: "#d4d4d4",
+    fontSize: "0.9rem",
+    lineHeight: 1.5,
+    whiteSpace: "pre-wrap" as const,
+    wordBreak: "break-word" as const,
+  },
+  notificationLabel: {
+    fontSize: "0.7rem",
+    color: "#a78bfa",
+    marginBottom: "4px",
+    fontWeight: 600,
+    letterSpacing: "0.03em",
   },
   inputArea: {
     padding: "12px 16px",

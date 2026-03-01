@@ -33,6 +33,10 @@ Key capabilities:
 - List, read, and write files in your R2 workspace using list_files, read_file, and write_file
 - Schedule tasks for future execution using schedule_task
 
+When scheduling tasks:
+- If the user asks to be messaged, reminded, or notified (e.g. "message me hello in 5 minutes", "remind me to check the oven"), set sendMessage to true and provide the message text.
+- If the user asks for a background task that does NOT require a visible notification (e.g. "clean up old files in 10 minutes"), leave sendMessage as false.
+
 When using tools, explain what you are doing and report results clearly.`;
 
 export class NanoChatAgent extends AIChatAgent<Env> {
@@ -104,13 +108,23 @@ export class NanoChatAgent extends AIChatAgent<Env> {
    *
    * This method is called by the Agents SDK scheduler when a delayed
    * task fires. It logs the execution and stores a note in group memory.
+   *
+   * The data parameter is either a plain string (legacy format) or an object
+   * with description, sendMessage, and message fields.
    */
-  async executeScheduledTask(description: string): Promise<void> {
+  async executeScheduledTask(
+    data: string | { description: string; sendMessage?: boolean; message?: string },
+  ): Promise<void> {
     // Ensure memory is initialized
     if (!this.memory) {
       initSchema(this.ctx.storage.sql);
       this.memory = new GroupMemory(this.ctx.storage.sql);
     }
+
+    // Handle both legacy string format and new object format
+    const description = typeof data === "string" ? data : data.description;
+    const sendMessage = typeof data === "string" ? false : (data.sendMessage ?? false);
+    const message = typeof data === "string" ? data : (data.message ?? data.description);
 
     const timestamp = new Date().toISOString();
     this.memory.set(
@@ -125,12 +139,25 @@ export class NanoChatAgent extends AIChatAgent<Env> {
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
       logId,
       "scheduled_task",
-      JSON.stringify({ description }),
+      JSON.stringify({ description, sendMessage }),
       JSON.stringify({ result: "completed", timestamp }),
       "success",
       Date.now(),
       0,
     );
+
+    // Broadcast a visible notification to connected clients if requested
+    if (sendMessage) {
+      this.broadcast(
+        JSON.stringify({
+          type: "scheduled-notification",
+          id: crypto.randomUUID(),
+          message,
+          taskDescription: description,
+          timestamp,
+        }),
+      );
+    }
   }
 
   /**
@@ -273,7 +300,7 @@ export class NanoChatAgent extends AIChatAgent<Env> {
 
       schedule_task: tool({
         description:
-          "Schedule a task to be executed in the future. The task description will be passed to the executeScheduledTask handler after the specified delay.",
+          "Schedule a task to be executed in the future. Set sendMessage to true when the user wants a visible notification or message in the chat (e.g. 'message me', 'remind me', 'notify me'). Leave sendMessage false for background tasks.",
         inputSchema: z.object({
           description: z
             .string()
@@ -282,21 +309,32 @@ export class NanoChatAgent extends AIChatAgent<Env> {
             .number()
             .positive()
             .describe("Number of seconds to delay before executing the task"),
+          sendMessage: z
+            .boolean()
+            .optional()
+            .default(false)
+            .describe("Set to true to send a visible message to the chat when the task fires. Use when the user asks to be messaged, reminded, or notified."),
+          message: z
+            .string()
+            .optional()
+            .describe("The message to display in the chat when the task fires. Required when sendMessage is true."),
         }),
-        execute: async ({ description, delaySeconds }) => {
+        execute: async ({ description, delaySeconds, sendMessage, message }) => {
           const start = Date.now();
           try {
             await agent.schedule(
               delaySeconds,
               "executeScheduledTask",
-              description,
+              { description, sendMessage, message: message ?? description },
             );
-            const result = `Task scheduled: "${description}" will run in ${delaySeconds} seconds`;
-            logToolExecution(sql, "schedule_task", { description, delaySeconds }, result, "success", Date.now() - start);
+            const result = sendMessage
+              ? `Task scheduled: "${description}" will run in ${delaySeconds} seconds and send message: "${message ?? description}"`
+              : `Task scheduled: "${description}" will run in ${delaySeconds} seconds`;
+            logToolExecution(sql, "schedule_task", { description, delaySeconds, sendMessage, message }, result, "success", Date.now() - start);
             return result;
           } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            logToolExecution(sql, "schedule_task", { description, delaySeconds }, message, "error", Date.now() - start);
+            const errMsg = error instanceof Error ? error.message : String(error);
+            logToolExecution(sql, "schedule_task", { description, delaySeconds }, errMsg, "error", Date.now() - start);
             throw error;
           }
         },
