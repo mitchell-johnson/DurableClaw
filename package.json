@@ -1,0 +1,32 @@
+{
+  "name": "durable-claw",
+  "version": "0.1.0",
+  "private": true,
+  "description": "NanoClaw AI agent framework on Cloudflare Durable Objects",
+  "scripts": {
+    "dev": "wrangler dev",
+    "build": "vite build && wrangler deploy --dry-run",
+    "deploy": "vite build && wrangler deploy",
+    "check": "tsc --noEmit",
+    "tail": "wrangler tail"
+  },
+  "dependencies": {
+    "@ai-sdk/anthropic": "^3.0.0",
+    "@ai-sdk/react": "^3.0.0",
+    "@cloudflare/ai-chat": "^0.1.5",
+    "agents": "^0.6.0",
+    "ai": "^6.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250214.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.3.0",
+    "typescript": "^5.7.0",
+    "vite": "^6.2.0",
+    "wrangler": "^3.109.0"
+  }
+}

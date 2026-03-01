@@ -1,0 +1,27 @@
+name = "durable-claw"
+main = "src/server.ts"
+compatibility_date = "2026-01-28"
+compatibility_flags = ["nodejs_compat"]
+
+[ai]
+binding = "AI"
+
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+
+[[durable_objects.bindings]]
+name = "NANO_CHAT_AGENT"
+class_name = "NanoChatAgent"
+
+[[r2_buckets]]
+binding = "WORKSPACE"
+bucket_name = "durable-claw-workspace"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["NanoChatAgent"]
+
+[vars]
+ANTHROPIC_MODEL = "claude-sonnet-4-6"
