@@ -8,14 +8,8 @@ function getOrCreateSessionId(): string {
   const hash = window.location.hash.slice(1);
   if (hash) return hash;
 
-  const stored = localStorage.getItem("durableclaw-session");
-  if (stored) {
-    window.location.hash = stored;
-    return stored;
-  }
-
+  // No hash present — start a fresh conversation every time
   const id = crypto.randomUUID().slice(0, 8);
-  localStorage.setItem("durableclaw-session", id);
   window.location.hash = id;
   return id;
 }
