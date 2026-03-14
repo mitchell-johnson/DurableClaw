@@ -8,6 +8,7 @@
     "build": "vite build && wrangler deploy --dry-run",
     "deploy": "vite build && wrangler deploy",
     "check": "tsc --noEmit",
+    "test": "vitest run",
     "tail": "wrangler tail"
   },
   "dependencies": {
@@ -27,6 +28,7 @@
     "@vitejs/plugin-react": "^4.3.0",
     "typescript": "^5.7.0",
     "vite": "^6.2.0",
+    "vitest": "^3.2.4",
     "wrangler": "^3.109.0"
   }
 }

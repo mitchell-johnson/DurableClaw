@@ -10,6 +10,7 @@ import { AIChatAgent } from "agents/ai-chat-agent";
 import type { OnChatMessageOptions } from "@cloudflare/ai-chat";
 import { getSchedulePrompt } from "agents/schedule";
 import {
+  generateText,
   streamText,
   convertToModelMessages,
   tool,
@@ -23,10 +24,25 @@ import { z } from "zod";
 import type { Env } from "../env";
 import { initSchema } from "./schema";
 import { GroupMemory } from "./memory";
+import {
+  formatMessagesForSummary,
+  RECENT_CHAT_CONTEXT_MESSAGES,
+  SUMMARY_CONTEXT_LIMIT,
+  SUMMARY_MAINTENANCE_INTERVAL_SECONDS,
+  SUMMARY_MAX_BATCHES_PER_RUN,
+  SUMMARY_MAX_MESSAGES,
+  SUMMARY_MIN_MESSAGES,
+  SUMMARY_RETAIN_RECENT_MESSAGES,
+  SUMMARY_SCHEDULE_META_KEY,
+  SummaryMemoryStore,
+  type ArchivedConversationMessage,
+} from "./summary-memory";
 
 const SYSTEM_PROMPT_BASE = `You are DurableClaw, a minimal AI agent running at the edge on Cloudflare Durable Objects.
 
 You are helpful, concise, and technically capable. You have access to persistent group memory, a file workspace backed by R2 storage, and the ability to schedule tasks for future execution.
+
+Older conversation history may be condensed into durable summary blocks. Treat those summaries as the canonical long-term record for older context.
 
 Key capabilities:
 - Store and recall persistent memories across conversations using memory_store and memory_recall
@@ -40,18 +56,18 @@ When scheduling tasks:
 When using tools, explain what you are doing and report results clearly.`;
 
 export class NanoChatAgent extends AIChatAgent<Env> {
-  // Keep the last 500 messages in SQLite storage
-  maxPersistedMessages = 500;
+  // Keep a smaller recent-chat window in raw form; older context moves into summaries.
+  maxPersistedMessages = RECENT_CHAT_CONTEXT_MESSAGES;
 
   private memory!: GroupMemory;
+  private summaryMemory!: SummaryMemoryStore;
 
   /**
    * Called when the Durable Object is first instantiated or wakes from hibernation.
    * Initializes the SQLite schema and group memory manager.
    */
   async onStart(): Promise<void> {
-    initSchema(this.ctx.storage.sql);
-    this.memory = new GroupMemory(this.ctx.storage.sql);
+    await this.ensureInitialized();
   }
 
   /**
@@ -64,11 +80,8 @@ export class NanoChatAgent extends AIChatAgent<Env> {
     onFinish: StreamTextOnFinishCallback<ToolSet>,
     options?: OnChatMessageOptions,
   ): Promise<Response | undefined> {
-    // Ensure schema and memory are initialized (defensive, in case onStart hasn't run)
-    if (!this.memory) {
-      initSchema(this.ctx.storage.sql);
-      this.memory = new GroupMemory(this.ctx.storage.sql);
-    }
+    await this.ensureInitialized();
+    this.summaryMemory.syncMessages(this.messages);
 
     const anthropic = createAnthropic({
       apiKey: this.env.ANTHROPIC_API_KEY,
@@ -77,10 +90,14 @@ export class NanoChatAgent extends AIChatAgent<Env> {
     const model = this.env.ANTHROPIC_MODEL || "claude-sonnet-4-6";
 
     // Build system prompt with memory context and scheduling awareness
+    const summaryContext = this.summaryMemory.getSummaryContext(SUMMARY_CONTEXT_LIMIT);
     const memoryContext = this.memory.getContext();
     const scheduleContext = getSchedulePrompt({ date: new Date() });
 
     const systemParts = [SYSTEM_PROMPT_BASE];
+    if (summaryContext) {
+      systemParts.push(summaryContext);
+    }
     if (memoryContext) {
       systemParts.push(memoryContext);
     }
@@ -89,6 +106,10 @@ export class NanoChatAgent extends AIChatAgent<Env> {
 
     // Convert UI messages to model messages for the API call
     const modelMessages = await convertToModelMessages(this.messages);
+    const finishAndArchive: StreamTextOnFinishCallback<ToolSet> = async (event) => {
+      await onFinish(event);
+      this.summaryMemory.syncMessages(this.messages);
+    };
 
     const result = streamText({
       model: anthropic(model),
@@ -96,7 +117,7 @@ export class NanoChatAgent extends AIChatAgent<Env> {
       messages: modelMessages,
       tools: this.buildTools(),
       stopWhen: stepCountIs(10),
-      onFinish,
+      onFinish: finishAndArchive,
       abortSignal: options?.abortSignal,
     });
 
@@ -115,11 +136,7 @@ export class NanoChatAgent extends AIChatAgent<Env> {
   async executeScheduledTask(
     data: string | { description: string; sendMessage?: boolean; message?: string },
   ): Promise<void> {
-    // Ensure memory is initialized
-    if (!this.memory) {
-      initSchema(this.ctx.storage.sql);
-      this.memory = new GroupMemory(this.ctx.storage.sql);
-    }
+    await this.ensureInitialized();
 
     // Handle both legacy string format and new object format
     const description = typeof data === "string" ? data : data.description;
@@ -157,6 +174,67 @@ export class NanoChatAgent extends AIChatAgent<Env> {
           timestamp,
         }),
       );
+    }
+  }
+
+  async runMemoryMaintenance(): Promise<void> {
+    await this.ensureInitialized();
+
+    const start = Date.now();
+    const anthropic = createAnthropic({
+      apiKey: this.env.ANTHROPIC_API_KEY,
+    });
+    const model = this.env.ANTHROPIC_MODEL || "claude-sonnet-4-6";
+
+    try {
+      this.summaryMemory.syncMessages(this.messages);
+
+      const summarizedWindows: string[] = [];
+      for (let index = 0; index < SUMMARY_MAX_BATCHES_PER_RUN; index += 1) {
+        const pendingMessages = this.summaryMemory.getMessagesForSummary({
+          lastSummarizedSequence: 0,
+          retainRecentMessages: SUMMARY_RETAIN_RECENT_MESSAGES,
+          minMessages: SUMMARY_MIN_MESSAGES,
+          maxMessages: SUMMARY_MAX_MESSAGES,
+        });
+
+        if (pendingMessages.length === 0) {
+          break;
+        }
+
+        const summary = await this.summarizeConversationWindow(
+          anthropic,
+          model,
+          pendingMessages,
+        );
+        this.summaryMemory.storeSummary(summary, pendingMessages);
+        summarizedWindows.push(
+          `${pendingMessages[0].sequence}-${pendingMessages[pendingMessages.length - 1].sequence}`,
+        );
+      }
+
+      const result = summarizedWindows.length > 0
+        ? `Summarized archived message windows: ${summarizedWindows.join(", ")}`
+        : "No archived message window was eligible for summarization.";
+      logToolExecution(
+        this.ctx.storage.sql,
+        "memory_maintenance",
+        { summarizedWindows },
+        result,
+        "success",
+        Date.now() - start,
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      logToolExecution(
+        this.ctx.storage.sql,
+        "memory_maintenance",
+        {},
+        message,
+        "error",
+        Date.now() - start,
+      );
+      throw error;
     }
   }
 
@@ -340,6 +418,47 @@ export class NanoChatAgent extends AIChatAgent<Env> {
         },
       }),
     };
+  }
+
+  private async ensureInitialized(): Promise<void> {
+    if (!this.memory || !this.summaryMemory) {
+      initSchema(this.ctx.storage.sql);
+      this.memory = new GroupMemory(this.ctx.storage.sql);
+      this.summaryMemory = new SummaryMemoryStore(this.ctx.storage.sql);
+    }
+
+    await this.ensureSummaryMaintenanceSchedule();
+  }
+
+  private async ensureSummaryMaintenanceSchedule(): Promise<void> {
+    if (this.summaryMemory.getMeta(SUMMARY_SCHEDULE_META_KEY)) {
+      return;
+    }
+
+    const schedule = await this.scheduleEvery(
+      SUMMARY_MAINTENANCE_INTERVAL_SECONDS,
+      "runMemoryMaintenance",
+    );
+    this.summaryMemory.setMeta(SUMMARY_SCHEDULE_META_KEY, schedule.id);
+  }
+
+  private async summarizeConversationWindow(
+    anthropic: ReturnType<typeof createAnthropic>,
+    model: string,
+    messages: ArchivedConversationMessage[],
+  ): Promise<string> {
+    const result = await generateText({
+      model: anthropic(model),
+      system:
+        "You are compressing old conversation history for DurableClaw's long-term memory. Capture concrete decisions, user preferences, file paths, open tasks, reminders, constraints, and outcomes. Be concise and factual. Return plain text bullet points with no heading.",
+      prompt: [
+        "Summarize this archived conversation window for future retrieval.",
+        "Prefer durable facts over chit-chat. If nothing important happened, say that briefly.",
+        formatMessagesForSummary(messages),
+      ].join("\n\n"),
+    });
+
+    return result.text.trim();
   }
 }
 

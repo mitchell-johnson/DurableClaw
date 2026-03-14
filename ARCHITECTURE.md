@@ -26,7 +26,7 @@ Rather than building from scratch on raw `DurableObject`, we extend `AIChatAgent
 - **Scheduling** — `this.schedule()` API for delayed task execution via the Alarms API
 - **Routing** — `routeAgentRequest()` handles WebSocket upgrade and HTTP routing to DO instances
 
-Our application-specific tables (`group_memory`, `execution_log`) sit alongside the SDK's internal tables in the same SQLite database.
+Our application-specific tables (`group_memory`, `archived_messages`, `conversation_summaries`, `memory_meta`, `execution_log`) sit alongside the SDK's internal tables in the same SQLite database.
 
 ### Vercel AI SDK v6 over Workers AI
 
@@ -49,8 +49,11 @@ Durable Object SQLite (`this.ctx.storage.sql`) provides:
 - Up to 10GB per DO instance
 - Zero-latency access (same V8 isolate)
 
-We use two custom tables:
+We use several custom tables:
 - `group_memory` — persistent key-value store for cross-conversation context
+- `archived_messages` — durable archive of chat messages for summary generation
+- `conversation_summaries` — condensed long-term memory over archived chat windows
+- `memory_meta` — metadata for recurring summary maintenance
 - `execution_log` — audit trail of all tool executions with timing data
 
 ### V8 Isolate Security Model
@@ -84,6 +87,7 @@ This is a weaker isolation boundary than OS-level containers, but sufficient for
 │                      │  │  SQLite DB   │  │  AI SDK v6   │  │   │
 │                      │  │             │  │              │  │   │
 │                      │  │ group_memory│  │ streamText() │  │   │
+│                      │  │ summaries   │  │ generateText()│ │   │
 │                      │  │ exec_log    │  │ tool()       │  │   │
 │                      │  │ cf_agents_* │  │ Claude API   │  │   │
 │                      │  └─────────────┘  └──────────────┘  │   │
@@ -138,7 +142,8 @@ durable-claw/
 2. `routeAgentRequest()` in `server.ts` routes the WebSocket upgrade to the correct DO instance
 3. `useAgentChat` sends messages over the WebSocket
 4. `NanoChatAgent.onChatMessage()` fires:
-   - Builds system prompt with group memory context + schedule context
+   - Archives the current persisted chat window into `archived_messages`
+   - Builds system prompt with summary memory + group memory + schedule context
    - Converts UI messages to model messages
    - Calls `streamText()` with Claude model and tool definitions
    - Streams response back via `result.toUIMessageStreamResponse()`
@@ -162,6 +167,14 @@ durable-claw/
 3. `executeScheduledTask(description)` runs:
    - Stores a completion record in group memory
    - Logs the execution to `execution_log`
+
+### Summary Maintenance
+
+1. `onStart()` ensures a recurring interval schedule exists for `runMemoryMaintenance`
+2. The maintenance callback archives any recent chat messages that are not already mirrored into `archived_messages`
+3. Older archived windows, excluding the recent raw-chat buffer, are summarized with Claude
+4. Summaries are written into `conversation_summaries`
+5. Future chat turns inject the newest summaries into the system prompt as long-term memory
 
 ## Tools
 
