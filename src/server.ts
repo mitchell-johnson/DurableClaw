@@ -1,51 +1,258 @@
-/**
- * Worker entrypoint for DurableClaw.
- *
- * Exports the NanoChatAgent Durable Object class and provides the
- * default fetch handler that routes requests to the agent or API endpoints.
- */
+export { NanoChatAgent } from "./durable-objects/NanoChatAgent";
+export { ResearchSubagent } from "./durable-objects/ResearchSubagent";
+import type { Env, AgentPrincipal } from "./types";
+import { authenticate, authorizePrincipal } from "./auth";
+import { boundedJson, validId } from "./utils/validation";
+import { doName } from "./durable-objects/assistant/principal";
+import { createInternalAuthHeaders } from "./utils/internalAuth";
+import { reconcileWakes } from "./scheduled/wakeReconciler";
 
-export { NanoChatAgent } from "./agent/index";
-
-import { routeAgentRequest } from "agents";
-import type { Env } from "./env";
-
-/**
- * Handle API routes (currently just /api/health).
- */
-function handleApiRequest(
-  _request: Request,
-  _env: Env,
-  url: URL,
-): Response {
-  if (url.pathname === "/api/health") {
-    return Response.json({
-      status: "ok",
-      service: "durable-claw",
-      timestamp: new Date().toISOString(),
-    });
-  }
-
-  return Response.json(
-    { error: "Not found" },
-    { status: 404 },
+const TICKET_TTL_MS = 30_000;
+async function ticketHash(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(value),
+  );
+  return Array.from(new Uint8Array(digest), (v) =>
+    v.toString(16).padStart(2, "0"),
+  ).join("");
+}
+function sameOrigin(request: Request): boolean {
+  const origin = request.headers.get("Origin");
+  return !origin || origin === new URL(request.url).origin;
+}
+async function signedHeaders(p: AgentPrincipal, env: Env) {
+  return createInternalAuthHeaders(
+    {
+      userId: p.userId,
+      organizationId: p.workspaceId,
+      tenantBinding: p.workspaceId,
+      role: p.role,
+    },
+    env.INTERNAL_AUTH_SECRET,
   );
 }
-
+async function ownerStub(env: Env, p: AgentPrincipal) {
+  const stub = env.NANO_CHAT_AGENT.get(
+    env.NANO_CHAT_AGENT.idFromName(doName(p.userId, p.workspaceId)),
+  );
+  const response = await stub.fetch("https://agent.internal/init", {
+    method: "POST",
+    headers: await signedHeaders(p, env),
+    body: "{}",
+  });
+  if (!response.ok) throw new Error("Agent initialization failed");
+  await response.body?.cancel();
+  return stub;
+}
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
-
-    // API routes
-    if (url.pathname.startsWith("/api/")) {
-      return handleApiRequest(request, env, url);
+    if (url.pathname === "/api/health")
+      return Response.json({ status: "ok", service: "durable-claw" });
+    if (
+      !url.pathname.startsWith("/api/") &&
+      !url.pathname.startsWith("/agents/")
+    )
+      return env.ASSETS.fetch(request);
+    if (!sameOrigin(request))
+      return Response.json({ error: "Origin rejected" }, { status: 403 });
+    try {
+      let p: AgentPrincipal | null = null;
+      if (
+        url.pathname === "/api/agent/connect" &&
+        request.headers.get("Upgrade")?.toLowerCase() === "websocket"
+      ) {
+        const token = url.searchParams.get("ticket");
+        const conversation = url.searchParams.get("conversation_id");
+        if (!token || token.length > 128 || !validId(conversation))
+          return Response.json(
+            { error: "Invalid socket ticket" },
+            { status: 401 },
+          );
+        const redeemed = await env.CONTROL_DB.prepare(
+          "DELETE FROM socket_tickets WHERE token_hash=? AND conversation_id=? AND expires_at>? RETURNING user_id,workspace_id",
+        )
+          .bind(await ticketHash(token), conversation, Date.now())
+          .first<{ user_id: string; workspace_id: string }>();
+        if (!redeemed)
+          return Response.json(
+            { error: "Socket ticket expired or consumed" },
+            { status: 401 },
+          );
+        p = await authorizePrincipal(
+          env,
+          redeemed.user_id,
+          redeemed.workspace_id,
+        );
+      } else p = await authenticate(request, env);
+      if (!p)
+        return Response.json(
+          { error: "Authentication required" },
+          { status: 401 },
+        );
+      if (url.pathname === "/api/socket-ticket" && request.method === "POST") {
+        const data = (await boundedJson(request)) as {
+          conversation_id?: unknown;
+        };
+        if (!validId(data.conversation_id))
+          return Response.json(
+            { error: "Invalid conversation ID" },
+            { status: 400 },
+          );
+        await env.CONTROL_DB.prepare(
+          "DELETE FROM socket_tickets WHERE expires_at<=?",
+        )
+          .bind(Date.now())
+          .run();
+        const token = crypto.randomUUID() + crypto.randomUUID();
+        await env.CONTROL_DB.prepare(
+          "INSERT INTO socket_tickets (token_hash,user_id,workspace_id,conversation_id,expires_at) VALUES (?,?,?,?,?)",
+        )
+          .bind(
+            await ticketHash(token),
+            p.userId,
+            p.workspaceId,
+            data.conversation_id,
+            Date.now() + TICKET_TTL_MS,
+          )
+          .run();
+        return Response.json(
+          { ticket: token },
+          { headers: { "cache-control": "no-store" } },
+        );
+      }
+      if (url.pathname === "/api/legacy/import" && request.method === "POST") {
+        // Old unauthenticated sessions have no ownership record. Only the explicitly configured single-owner installation can adopt them.
+        if (env.AUTH || p.userId !== "owner" || p.workspaceId !== "default")
+          return Response.json(
+            { error: "Legacy import requires single-owner mode" },
+            { status: 403 },
+          );
+        const data = (await boundedJson(request)) as {
+          session_id?: unknown;
+          after?: unknown;
+        };
+        if (!validId(data.session_id) || data.session_id.length > 100)
+          return Response.json(
+            { error: "Invalid legacy session" },
+            { status: 400 },
+          );
+        const after =
+          Number.isSafeInteger(data.after) && Number(data.after) >= 0
+            ? Number(data.after)
+            : 0;
+        const old = env.NANO_CHAT_AGENT.get(
+          env.NANO_CHAT_AGENT.idFromName(data.session_id),
+        );
+        const response = await old.fetch(
+          "https://agent.internal/legacy-export?after=" + after,
+          { headers: await signedHeaders(p, env) },
+        );
+        if (!response.ok) throw new Error("Legacy export failed");
+        const page = await response.json();
+        const target = await ownerStub(env, p);
+        const imported = await target.fetch(
+          "https://agent.internal/legacy-import",
+          {
+            method: "POST",
+            headers: await signedHeaders(p, env),
+            body: JSON.stringify({ session: data.session_id, page }),
+          },
+        );
+        return Response.json({
+          ...((await imported.json()) as object),
+          next_cursor: (page as { next_cursor: number | null }).next_cursor,
+        });
+      }
+      if (url.pathname === "/api/events" && request.method === "POST") {
+        const data = (await boundedJson(request)) as {
+          kind?: unknown;
+          resource_id?: unknown;
+          summary?: unknown;
+          salience?: unknown;
+        };
+        if (
+          typeof data.kind !== "string" ||
+          data.kind.length > 64 ||
+          typeof data.resource_id !== "string" ||
+          data.resource_id.length > 512 ||
+          typeof data.summary !== "string" ||
+          data.summary.length > 4000
+        )
+          return Response.json({ error: "Invalid event" }, { status: 400 });
+        await env.CONTROL_DB.prepare(
+          "INSERT INTO workspace_events (user_id,workspace_id,kind,resource_id,summary,salience,occurred_at) VALUES (?,?,?,?,?,?,?)",
+        )
+          .bind(
+            p.userId,
+            p.workspaceId,
+            data.kind,
+            data.resource_id,
+            data.summary,
+            ["low", "medium", "high"].includes(String(data.salience))
+              ? String(data.salience)
+              : "medium",
+            Date.now(),
+          )
+          .run();
+        return Response.json({ accepted: true }, { status: 202 });
+      }
+      if (url.pathname === "/api/inbox" && request.method === "GET") {
+        const items = await env.CONTROL_DB.prepare(
+          "SELECT id,kind,content,created_at,read_at FROM inbox WHERE user_id=? AND workspace_id=? ORDER BY created_at DESC LIMIT 100",
+        )
+          .bind(p.userId, p.workspaceId)
+          .all();
+        return Response.json({ items: items.results });
+      }
+      if (url.pathname.startsWith("/api/agent/")) {
+        const path = url.pathname.slice("/api/agent".length);
+        const allowed =
+          /^\/(init|persona|connect|conversations(?:\/[a-zA-Z0-9_-]{1,128}(?:\/messages|\/confirmations\/[a-zA-Z0-9_-]{1,128})?)?|memories(?:\/(?:forget-all|[a-zA-Z0-9_-]{1,128}))?|activity\/wakes(?:\/[a-zA-Z0-9_-]{1,128})?)$/;
+        if (!allowed.test(path))
+          return Response.json({ error: "Not found" }, { status: 404 });
+        const stub = await ownerStub(env, p);
+        const headers = new Headers(await signedHeaders(p, env));
+        if (request.headers.get("Upgrade")?.toLowerCase() === "websocket")
+          headers.set("Upgrade", "websocket");
+        const target = new URL("https://agent.internal" + path);
+        for (const key of [
+          "conversation_id",
+          "limit",
+          "cursor",
+          "before",
+          "type",
+          "offset",
+        ]) {
+          const v = url.searchParams.get(key);
+          if (v !== null) target.searchParams.set(key, v);
+        }
+        const body =
+          ["GET", "HEAD"].includes(request.method) ||
+          (!request.body && request.method === "DELETE")
+            ? undefined
+            : JSON.stringify(await boundedJson(request));
+        return stub.fetch(
+          new Request(target, { method: request.method, headers, body }),
+        );
+      }
+      return Response.json({ error: "Not found" }, { status: 404 });
+    } catch (error) {
+      return Response.json(
+        {
+          error:
+            error instanceof SyntaxError ? "Invalid JSON" : "Request failed",
+        },
+        { status: error instanceof SyntaxError ? 400 : 500 },
+      );
     }
-
-    // Agent WebSocket and HTTP routing
-    const agentResponse = await routeAgentRequest(request, env);
-    if (agentResponse) return agentResponse;
-
-    // Fall through to static assets (SPA)
-    return env.ASSETS.fetch(request);
+  },
+  async scheduled(
+    _event: ScheduledController,
+    env: Env,
+    ctx: ExecutionContext,
+  ) {
+    ctx.waitUntil(reconcileWakes(env));
   },
 } satisfies ExportedHandler<Env>;

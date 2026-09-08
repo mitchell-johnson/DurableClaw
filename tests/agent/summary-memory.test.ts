@@ -132,6 +132,8 @@ describe("formatMessagesForSummary", () => {
       },
     ]);
 
-    expect(formatted).toBe("[3] user: First point\n[4] assistant: Second point");
+    expect(formatted).toBe(
+      "[3] user: First point\n[4] assistant: Second point",
+    );
   });
 });

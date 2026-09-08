@@ -1,0 +1,21 @@
+name = "durable-claw-tests"
+main = "src/server.ts"
+compatibility_date = "2026-08-15"
+compatibility_flags = ["nodejs_compat"]
+
+[[durable_objects.bindings]]
+name = "NANO_CHAT_AGENT"
+class_name = "NanoChatAgent"
+[[durable_objects.bindings]]
+name = "RESEARCH_SUBAGENT"
+class_name = "ResearchSubagent"
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["NanoChatAgent", "ResearchSubagent"]
+[[r2_buckets]]
+binding = "WORKSPACE"
+bucket_name = "test-workspace"
+[[d1_databases]]
+binding = "CONTROL_DB"
+database_name = "test-control"
+database_id = "00000000-0000-0000-0000-000000000000"

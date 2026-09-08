@@ -16,7 +16,7 @@ export interface FileMetadata {
 export class R2Workspace {
   constructor(
     private bucket: R2Bucket,
-    private prefix: string
+    private prefix: string,
   ) {}
 
   private key(path: string): string {
@@ -70,7 +70,7 @@ export class R2Workspace {
   async writeFile(
     path: string,
     content: string,
-    metadata?: Record<string, string>
+    metadata?: Record<string, string>,
   ): Promise<void> {
     await this.bucket.put(this.key(path), content, {
       httpMetadata: { contentType: "text/plain" },
@@ -81,7 +81,7 @@ export class R2Workspace {
   async writeFileBytes(
     path: string,
     data: ArrayBuffer | ReadableStream,
-    contentType?: string
+    contentType?: string,
   ): Promise<void> {
     await this.bucket.put(this.key(path), data, {
       httpMetadata: contentType ? { contentType } : undefined,

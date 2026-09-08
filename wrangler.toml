@@ -1,6 +1,6 @@
 name = "durable-claw"
 main = "src/server.ts"
-compatibility_date = "2026-01-28"
+compatibility_date = "2026-08-15"
 compatibility_flags = ["nodejs_compat"]
 
 [ai]
@@ -10,18 +10,44 @@ binding = "AI"
 directory = "./dist"
 binding = "ASSETS"
 not_found_handling = "single-page-application"
+run_worker_first = ["/api/*", "/agents/*"]
 
 [[durable_objects.bindings]]
 name = "NANO_CHAT_AGENT"
 class_name = "NanoChatAgent"
 
+[[durable_objects.bindings]]
+name = "RESEARCH_SUBAGENT"
+class_name = "ResearchSubagent"
+
 [[r2_buckets]]
 binding = "WORKSPACE"
 bucket_name = "durable-claw-workspace"
 
+[[d1_databases]]
+binding = "CONTROL_DB"
+database_name = "durable-claw-control"
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"
+
+# Keep v1: existing agent objects retain their identity and stored data.
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["NanoChatAgent"]
 
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["ResearchSubagent"]
+
+[triggers]
+crons = ["* * * * *"]
+
+[observability]
+enabled = true
+head_sampling_rate = 1
+
 [vars]
-ANTHROPIC_MODEL = "claude-sonnet-4-6"
+CHAT_MODEL = ""
+BACKGROUND_MODEL = ""
+BATCH_MODEL = ""
+PROACTIVE_DISABLED = "false"

@@ -56,7 +56,7 @@ export class WhatsAppChannel {
   constructor(
     private env: Env,
     private onMessage: (msg: WhatsAppMessage) => Promise<void>,
-    config?: Partial<WhatsAppConfig>
+    config?: Partial<WhatsAppConfig>,
   ) {
     this.config = { ...DEFAULT_CONFIG, ...config };
   }
@@ -102,7 +102,9 @@ export class WhatsAppChannel {
     // 4. On message received, call this.onMessage()
     //
     // For now, this is a no-op pending Baileys runtime validation.
-    console.log("[WhatsApp] Channel architecture ready, awaiting Baileys integration");
+    console.log(
+      "[WhatsApp] Channel architecture ready, awaiting Baileys integration",
+    );
   }
 
   async disconnect(): Promise<void> {

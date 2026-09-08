@@ -42,7 +42,10 @@ type ToolLikePart = UIMessage["parts"][number] & {
   errorText?: string;
 };
 
-interface ArchivedConversationMessageRow extends Record<string, SqlStorageValue> {
+interface ArchivedConversationMessageRow extends Record<
+  string,
+  SqlStorageValue
+> {
   sequence: number;
   message_id: string;
   role: string;
@@ -152,7 +155,9 @@ export function formatMessagesForSummary(
 ): string {
   return [...messages]
     .sort((a, b) => a.sequence - b.sequence)
-    .map((message) => `[${message.sequence}] ${message.role}: ${message.content}`)
+    .map(
+      (message) => `[${message.sequence}] ${message.role}: ${message.content}`,
+    )
     .join("\n");
 }
 
@@ -182,7 +187,9 @@ export class SummaryMemoryStore {
     }
   }
 
-  getMessagesForSummary(options: SummarySelectionOptions): ArchivedConversationMessage[] {
+  getMessagesForSummary(
+    options: SummarySelectionOptions,
+  ): ArchivedConversationMessage[] {
     const rows = this.sql
       .exec<ArchivedConversationMessageRow>(
         "SELECT sequence, message_id, role, content, created_at FROM archived_messages ORDER BY sequence ASC",

@@ -1,3 +1,5 @@
+> Historical design for the original runtime. See [the upgrade guide](../upgrading.md) and [current architecture](../../ARCHITECTURE.md) for the implemented system.
+
 # Summary-First Memory Implementation Plan
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
@@ -11,6 +13,7 @@
 ### Task 1: Test Harness And Summary Helper Tests
 
 **Files:**
+
 - Modify: `package.json`
 - Create: `tests/agent/summary-memory.test.ts`
 
@@ -35,6 +38,7 @@ Expected: PASS
 ### Task 2: Durable Object Summary Storage
 
 **Files:**
+
 - Modify: `src/agent/schema.ts`
 - Create: `src/agent/summary-memory.ts`
 
@@ -59,6 +63,7 @@ Expected: PASS
 ### Task 3: Agent Integration And Periodic Maintenance
 
 **Files:**
+
 - Modify: `src/agent/index.ts`
 
 **Step 1: Write the failing test**
@@ -82,6 +87,7 @@ Expected: PASS
 ### Task 4: Verification And Documentation
 
 **Files:**
+
 - Modify: `ARCHITECTURE.md`
 
 **Step 1: Verify implementation**

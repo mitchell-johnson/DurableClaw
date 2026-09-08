@@ -1,0 +1,37 @@
+export interface Env extends Omit<
+  Cloudflare.Env,
+  "CHAT_MODEL" | "BACKGROUND_MODEL" | "BATCH_MODEL" | "PROACTIVE_DISABLED"
+> {
+  MEMORY_INDEX?: VectorizeIndex;
+  DOCUMENT_INDEX?: VectorizeIndex;
+  AUTH?: Fetcher;
+  AGENT_TOKEN?: string;
+  INTERNAL_AUTH_SECRET: string;
+  MCP_CREDENTIALS_SECRET?: string;
+  OPENROUTER_API_KEY?: string;
+  OPENROUTER_BASE_URL?: string;
+  CHAT_MODEL: string;
+  BACKGROUND_MODEL: string;
+  BATCH_MODEL: string;
+  PROACTIVE_DISABLED?: string;
+  LOCAL_DEV?: string;
+  ENVIRONMENT?: string;
+  OTLP_ENDPOINT?: string;
+  OTLP_HEADERS?: string;
+  OTEL_TRACE_SAMPLE_RATE?: string;
+  OTEL_TRACE_SLOW_MS?: string;
+  OTEL_EXPORTER_OTLP_ENDPOINT?: string;
+  OTEL_EXPORTER_OTLP_HEADERS?: string;
+  OTEL_SERVICE_NAME?: string;
+  OTEL_TRACES_SAMPLER_ARG?: string;
+  OTEL_TAIL_SAMPLE_RATE?: string;
+  WAKE_MAX_DAILY_TRIAGE_TURNS?: string;
+  WAKE_MAX_DAILY_SUBAGENT_SPAWNS?: string;
+  WAKE_MAX_NOTIFICATIONS_PER_WAKE?: string;
+  WAKE_SIGNAL_DEDUPE_TTL_MS?: string;
+  WAKE_SIGNAL_DEDUPE_TTL_HOURS?: string;
+  WAKE_DAILY_MAX_TOKENS?: string;
+  WAKE_DAILY_MAX_SUBAGENTS?: string;
+  WAKE_NOTIFICATION_CAP?: string;
+  WAKE_SIGNAL_DEDUPE_TTL_DAYS?: string;
+}
