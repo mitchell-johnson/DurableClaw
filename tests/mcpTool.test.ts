@@ -233,4 +233,39 @@ describe("assembled MCP tools", () => {
       count: 0,
     });
   });
+  it("does not retarget an approved call to a different server configuration", async () => {
+    const sql = createSqliteStorage();
+    ensureToolConfirmationsSchema(sql);
+    const execute = vi.fn(async () => "done");
+    const make = (confirmationScope: string) =>
+      createMcpTool(
+        {
+          serverName: "same",
+          tool: { name: "action", inputSchema: { type: "object" } },
+          execute,
+        },
+        {
+          confirmations: makeSqliteConfirmationCoordinator(sql),
+          conversationId: "conversation",
+          confirmationScope,
+        },
+      ).tool;
+    const preview = JSON.parse(
+      await make("original-server").execute({ arguments: {} }),
+    );
+    decideToolConfirmation(
+      sql,
+      preview.confirmation_id,
+      "confirmed",
+      Date.now(),
+    );
+    const result = JSON.parse(
+      await make("replacement-server").execute({
+        arguments: {},
+        confirmation_id: preview.confirmation_id,
+      }),
+    );
+    expect(result.needs_confirmation).toBe(true);
+    expect(execute).not.toHaveBeenCalled();
+  });
 });

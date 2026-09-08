@@ -6,18 +6,23 @@ import type { Env } from "../../types";
 import {
   writeMemory,
   deleteMemoriesByIds,
-  listMemories,
-  listAllMemoryIds,
+  listMemoryInventoryIdsPage,
+  getInventoryMemoriesByIds,
   buildNamespace,
   type AgentMemoryType,
 } from "../../utils/memoryClient";
 import { logWarn } from "../../telemetry/logger";
+import {
+  MEMORY_SOURCE_SCHEMA_SQL,
+  excludeAllMemorySources,
+} from "./memorySources";
 
 export interface DreamSql {
   exec(query: string, ...bindings: unknown[]): { toArray(): unknown[] };
 }
 
 export const MEMORY_INDEX_SCHEMA_SQL = `
+${MEMORY_SOURCE_SCHEMA_SQL}
 CREATE TABLE IF NOT EXISTS memory_index (
   vector_id TEXT PRIMARY KEY,
   type TEXT NOT NULL,
@@ -105,7 +110,8 @@ export interface DreamPayload {
 }
 
 /** Best-effort repair of recent R2 inventory entries missing from the local index.
- * New writes are indexed synchronously; recovery examines a bounded recent slice.
+ * Each pass scans at most 50 keys; a durable cursor continues the inventory walk.
+ * Only recent source observations qualify for repair, as on the legacy path.
  * Forget-all independently enumerates every R2 page, without a search top-K cap.
  */
 export async function hydrateLegacyMemoryIndex(args: {
@@ -119,14 +125,31 @@ export async function hydrateLegacyMemoryIndex(args: {
   if (readForgetState(args.sql)) return;
   const now = args.now ?? Date.now();
   const namespace = buildNamespace(args.user_id, args.tenant_binding);
-  const { matches } = await listMemories(args.env, {
+  const cursor = (
+    args.sql
+      .exec("SELECT cursor FROM memory_inventory_cursors WHERE kind='repair'")
+      .toArray()[0] as { cursor: string } | undefined
+  )?.cursor;
+  const page = await listMemoryInventoryIdsPage(args.env, {
     user_id: args.user_id,
     tenant_binding: args.tenant_binding,
-    typeFilter: ["raw", "tool_call", "summary"],
     limit: 50,
+    cursor,
+  });
+  const matches = await getInventoryMemoriesByIds(args.env, {
+    user_id: args.user_id,
+    tenant_binding: args.tenant_binding,
+    ids: page.ids,
   });
   if ((args.stillValid && !args.stillValid()) || readForgetState(args.sql))
     return;
+  if (page.cursor)
+    args.sql.exec(
+      "INSERT OR REPLACE INTO memory_inventory_cursors(kind,cursor) VALUES ('repair',?)",
+      page.cursor,
+    );
+  else
+    args.sql.exec("DELETE FROM memory_inventory_cursors WHERE kind='repair'");
   for (const match of matches) {
     const memory = match.metadata;
     if (
@@ -496,6 +519,8 @@ export function beginForgetAll(args: {
   const existing = readForgetState(args.sql);
   if (existing) return existing.operation_id;
   const operationId = crypto.randomUUID();
+  excludeAllMemorySources(args.sql);
+  args.sql.exec("DELETE FROM memory_inventory_cursors WHERE kind='forget'");
   args.sql.exec(
     "INSERT INTO memory_forget_state (id, operation_id, user_id, tenant_binding, started_at) VALUES (1, ?, ?, ?, ?)",
     operationId,
@@ -503,12 +528,9 @@ export function beginForgetAll(args: {
     args.tenant_binding,
     Date.now(),
   );
-  const ids = args.sql
-    .exec("SELECT vector_id FROM memory_index")
-    .toArray() as Array<{ vector_id: string }>;
-  markMemoriesForDeletion(
-    args.sql,
-    ids.map((row) => row.vector_id),
+  args.sql.exec(
+    "UPDATE memory_index SET tier = 'cold', deleting_at = ?",
+    Date.now(),
   );
   return operationId;
 }
@@ -527,12 +549,18 @@ export async function completeForgetAllLegacyListing(args: {
       "MEMORY_INDEX unavailable; memory deletion remains pending",
     );
   if (state.legacy_list_complete) return;
-  const ids = await listAllMemoryIds(args.env, {
+  const cursor = (
+    args.sql
+      .exec("SELECT cursor FROM memory_inventory_cursors WHERE kind='forget'")
+      .toArray()[0] as { cursor: string } | undefined
+  )?.cursor;
+  const page = await listMemoryInventoryIdsPage(args.env, {
     user_id: state.user_id,
     tenant_binding: state.tenant_binding,
+    cursor,
   });
   if (readForgetState(args.sql)?.operation_id !== state.operation_id) return;
-  const originalIds = ids.filter((id) => {
+  const originalIds = page.ids.filter((id) => {
     const row = args.sql
       .exec("SELECT deleting_at FROM memory_index WHERE vector_id = ?", id)
       .toArray()[0] as { deleting_at: number | null } | undefined;
@@ -540,6 +568,20 @@ export async function completeForgetAllLegacyListing(args: {
     return !row || row.deleting_at !== null;
   });
   markMemoriesForDeletion(args.sql, originalIds);
+  for (const id of originalIds)
+    args.sql.exec(
+      "INSERT OR IGNORE INTO memory_write_scopes(vector_id,user_namespace) VALUES (?,?)",
+      id,
+      buildNamespace(state.user_id, state.tenant_binding),
+    );
+  if (page.cursor) {
+    args.sql.exec(
+      "INSERT OR REPLACE INTO memory_inventory_cursors(kind,cursor) VALUES ('forget',?)",
+      page.cursor,
+    );
+    return;
+  }
+  args.sql.exec("DELETE FROM memory_inventory_cursors WHERE kind='forget'");
   args.sql.exec(
     "UPDATE memory_forget_state SET legacy_list_complete = 1 WHERE operation_id = ?",
     state.operation_id,
@@ -598,6 +640,7 @@ export async function cleanupPendingMemoryDeletions(args: {
   limit?: number;
 }): Promise<boolean> {
   await completeForgetAllLegacyListing(args);
+  if (readForgetState(args.sql)?.legacy_list_complete === 0) return false;
   const limit = Math.max(1, Math.min(100, Math.floor(args.limit ?? 100)));
   const rows = args.sql
     .exec(

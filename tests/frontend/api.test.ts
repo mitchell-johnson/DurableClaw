@@ -73,4 +73,16 @@ describe("authenticated browser transport", () => {
       },
     ]);
   });
+  it("passes opaque conversation page cursors without truncating them", async () => {
+    const fetch = vi.fn(async () =>
+      Response.json({ conversations: [], next_cursor: "next+/=" }),
+    );
+    vi.stubGlobal("fetch", fetch);
+    const data =
+      await createChatEndpoints("credential").listConversationsPage!("last+/=");
+    expect(fetch.mock.calls[0][0]).toBe(
+      "/api/agent/conversations?cursor=last%2B%2F%3D",
+    );
+    expect(data).toEqual({ conversations: [], nextCursor: "next+/=" });
+  });
 });

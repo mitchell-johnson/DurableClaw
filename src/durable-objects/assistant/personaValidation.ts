@@ -1,7 +1,12 @@
 import { z } from "zod";
 import type { Env } from "../../types";
-import { encryptCredentials } from "./mcpCrypto";
-import { isPrivateOrInternalHost } from "./mcpClient";
+import {
+  encryptCredentials,
+  decryptStoredCredentials,
+  validateMcpHeaders,
+} from "./mcpCrypto";
+import { requireHttpsURL, type MCPServerConfig } from "./mcpClient";
+import { RequestValidationError } from "../../utils/validation";
 const id = z.string().regex(/^[a-zA-Z0-9_-]{1,128}$/);
 const server = z
   .object({
@@ -39,30 +44,73 @@ const schema = z
       .optional(),
   })
   .strict();
-export async function validatePersona(input: unknown, env: Env) {
-  const result = schema.parse(input);
+export async function validatePersona(
+  input: unknown,
+  env: Env,
+  owner: {
+    userId: string;
+    workspaceId: string;
+    existingServers: MCPServerConfig[];
+  },
+) {
+  const parsed = schema.safeParse(input);
+  if (!parsed.success)
+    throw new RequestValidationError("Invalid persona settings");
+  const result = parsed.data;
   if (result.mcp_servers) {
     const names = new Set<string>();
     const encrypted = [];
     for (const item of result.mcp_servers) {
-      if (names.has(item.name)) throw new Error("Duplicate MCP server");
+      if (names.has(item.name))
+        throw new RequestValidationError("Duplicate MCP server");
       names.add(item.name);
-      const url = new URL(item.url);
-      if (
-        url.protocol !== "https:" ||
-        url.username ||
-        url.password ||
-        isPrivateOrInternalHost(url.hostname)
-      )
-        throw new Error("MCP server must be public HTTPS");
+      let url: URL;
+      try {
+        url = requireHttpsURL(item.url);
+        if (item.headers) validateMcpHeaders(item.headers);
+      } catch (error) {
+        throw new RequestValidationError((error as Error).message);
+      }
+      const scope = {
+        userId: owner.userId,
+        workspaceId: owner.workspaceId,
+        serverName: item.name,
+        serverUrl: url.href,
+      };
+      let headersEncrypted: string | undefined;
+      if (item.headers) {
+        headersEncrypted = await encryptCredentials(env, item.headers, scope);
+      } else if (item.headers_encrypted) {
+        const stored = owner.existingServers.find(
+          (previous) => previous.name === item.name,
+        );
+        if (
+          !stored ||
+          new URL(stored.url).href !== url.href ||
+          stored.headers_encrypted !== item.headers_encrypted
+        )
+          throw new RequestValidationError(
+            "MCP credentials can only be retained on their existing server; provide new headers to change it",
+          );
+        try {
+          const headers = await decryptStoredCredentials(
+            env,
+            item.headers_encrypted,
+            scope,
+          );
+          headersEncrypted = item.headers_encrypted.startsWith("v2:")
+            ? item.headers_encrypted
+            : await encryptCredentials(env, headers, scope);
+        } catch {
+          throw new RequestValidationError(
+            "MCP credentials cannot be retained; provide new headers",
+          );
+        }
+      }
       encrypted.push({
         name: item.name,
-        url: item.url,
-        ...(item.headers
-          ? { headers_encrypted: await encryptCredentials(env, item.headers) }
-          : item.headers_encrypted
-            ? { headers_encrypted: item.headers_encrypted }
-            : {}),
+        url: url.href,
+        ...(headersEncrypted ? { headers_encrypted: headersEncrypted } : {}),
       });
     }
     result.mcp_servers = encrypted;

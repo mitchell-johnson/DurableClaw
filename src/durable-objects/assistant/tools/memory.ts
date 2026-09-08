@@ -25,6 +25,12 @@
  */
 
 import { writeOwnedMemory } from "../ownedMemory";
+import {
+  memoryTurnMessageIds,
+  recordMemorySourceMessages,
+  excludeForgottenMemorySources,
+  sourceMessageIdsFromMetadata,
+} from "../memorySources";
 import type { Env } from "../../../types";
 import {
   queryMemory,
@@ -112,17 +118,29 @@ export function createMemoryTools(ctx: MemoryToolContext) {
             confirmation: "Long-term memory is disabled.",
             persisted: false,
           });
+        // Include the originating user-message ID as a stable turn anchor.
+        // Stop may admit another turn before this write finishes.
+        const sourceMessageIds = ctx.conversation_id
+          ? memoryTurnMessageIds(ctx.sql, ctx.conversation_id)
+          : [];
         const result = await writeOwnedMemory({
           env: ctx.env,
           sql: ctx.sql,
           onDeletionPending: ctx.onDeletionPending,
+          onCommit: (vectorId) => {
+            if (ctx.conversation_id)
+              recordMemorySourceMessages(ctx.sql, vectorId, sourceMessageIds);
+          },
           memory: {
             user_id: ctx.user_id,
             tenant_binding: ctx.tenant_binding,
             conversation_id: ctx.conversation_id,
             type: "memory",
             content: fact,
-            extra: { source: "remember_tool" },
+            extra: {
+              source: "remember_tool",
+              source_message_ids: JSON.stringify(sourceMessageIds),
+            },
             stillValid,
           },
         });
@@ -203,7 +221,21 @@ export function createMemoryTools(ctx: MemoryToolContext) {
           // model; if SQL throws we log and warn (cleanup is
           // recoverable later by the orphan-link sweep in scheduled maintenance).
           ctx.onForget?.();
-          const deletionIds = planMemoryDeletion(ctx.sql, validIds);
+          const deletionIds = planMemoryDeletion(
+            ctx.sql,
+            excludeForgottenMemorySources(
+              ctx.sql,
+              validIds,
+              Object.fromEntries(
+                candidates
+                  .filter((c) => validIds.includes(c.vector_id))
+                  .map((c) => [
+                    c.vector_id,
+                    sourceMessageIdsFromMetadata(c.metadata.extra),
+                  ]),
+              ),
+            ),
+          );
           markMemoriesForDeletion(ctx.sql, deletionIds);
           ctx.onDeletionPending?.();
           let vectorOk = false;

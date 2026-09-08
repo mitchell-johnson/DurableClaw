@@ -40,4 +40,64 @@ describe("additive legacy upgrade", () => {
         .content,
     ).toBe("Message 1");
   });
+  it("separates imported message, memory and summary identities across sessions", () => {
+    const sql = createSqliteStorage() as any;
+    new ConversationHistoryStore(sql).ensureTables();
+    const empty = {
+      messages: [],
+      memories: [],
+      summaries: [],
+      next_cursor: null,
+    };
+    const pages = [
+      [
+        "a",
+        {
+          ...empty,
+          memories: [{ key: "1", value: "First saved memory", updated_at: 10 }],
+        },
+      ],
+      [
+        "memory-a",
+        {
+          ...empty,
+          messages: [
+            {
+              sequence: 1,
+              message_id: "source-1",
+              role: "user",
+              content: "Distinct message",
+              created_at: 20,
+            },
+          ],
+        },
+      ],
+      [
+        "a-b",
+        {
+          ...empty,
+          memories: [{ key: "c", value: "Other saved memory", updated_at: 30 }],
+        },
+      ],
+      [
+        "a",
+        {
+          ...empty,
+          memories: [{ key: "b-c", value: "Fourth memory", updated_at: 40 }],
+        },
+      ],
+    ] as const;
+    for (const [session, page] of pages)
+      importLegacyPage(sql, session, page as any);
+    for (const [session, page] of pages)
+      importLegacyPage(sql, session, page as any);
+    const rows = sql
+      .exec("SELECT content,conversation_id FROM messages")
+      .toArray();
+    expect(rows).toHaveLength(4);
+    expect(
+      rows.find((row: any) => row.content === "Distinct message")
+        ?.conversation_id,
+    ).toBe("legacy-memory-a");
+  });
 });

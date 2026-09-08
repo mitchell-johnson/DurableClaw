@@ -386,6 +386,7 @@ export class ConversationHistoryStore {
     fullText: string,
   ): string | null {
     let assistantMessageId: string | null = null;
+    let hasAssistantText = false;
     if (responseMessages && responseMessages.length > 0) {
       for (const msg of responseMessages) {
         const text =
@@ -398,6 +399,7 @@ export class ConversationHistoryStore {
                   .join("")
               : "";
         if (msg.role === "assistant") {
+          hasAssistantText ||= text.length > 0;
           assistantMessageId = this.appendMessage({
             conversationId,
             role: "assistant",
@@ -440,7 +442,10 @@ export class ConversationHistoryStore {
           }
         }
       }
-    } else if (fullText) {
+    }
+    // A tool-only response still has provider messages. Its visible fallback
+    // needs its own durable bubble so replay can also anchor the tool results.
+    if (fullText && !hasAssistantText) {
       assistantMessageId = this.appendMessage({
         conversationId,
         role: "assistant",

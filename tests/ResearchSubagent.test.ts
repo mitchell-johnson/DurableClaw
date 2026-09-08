@@ -69,7 +69,15 @@ function fixture() {
   const fetch = vi.fn(async (_request: Request) =>
     Response.json({ accepted: true }),
   );
-  const get = vi.fn(() => ({ fetch }));
+  const policyFetch = vi.fn(async () =>
+    Response.json({ tools: ["search_records"] }),
+  );
+  const get = vi.fn(() => ({
+    fetch: (request: Request) =>
+      new URL(request.url).pathname === "/tool-policy"
+        ? policyFetch().then((response) => response.clone())
+        : fetch(request),
+  }));
   const env = {
     NANO_CHAT_AGENT: { idFromName: vi.fn((name) => name), get },
     INTERNAL_AUTH_SECRET: SECRET,
@@ -79,6 +87,7 @@ function fixture() {
     values,
     storage,
     fetch,
+    policyFetch,
     get,
     env,
     state,
@@ -110,6 +119,50 @@ afterEach(() => {
 });
 
 describe("durable child lifecycle", () => {
+  it("omits persona-disabled tools before starting a research model", async () => {
+    const f = fixture();
+    f.policyFetch.mockResolvedValue(Response.json({ tools: [] }));
+    await dispatch(f);
+    await f.agent.alarm();
+    expect(mocks.run).not.toHaveBeenCalled();
+    expect(await reported(f)).toMatchObject({ status: "failed" });
+  });
+  it("rechecks the parent's current policy before every child tool execution", async () => {
+    const f = fixture();
+    const execute = vi.fn(async () => "data");
+    mocks.retrieval.mockReturnValueOnce({ search_records: { execute } });
+    mocks.run.mockImplementationOnce(async (params) => {
+      f.policyFetch.mockResolvedValue(Response.json({ tools: [] }));
+      await expect(params.tools.search_records.execute({}, {})).rejects.toThrow(
+        /policy|disabled/i,
+      );
+      return success;
+    });
+    await dispatch(f);
+    await f.agent.alarm();
+    expect(execute).not.toHaveBeenCalled();
+  });
+  it("withholds a completed read if policy changed while the child awaited it", async () => {
+    const f = fixture();
+    mocks.retrieval.mockReturnValueOnce({
+      search_records: {
+        execute: async () => {
+          f.policyFetch.mockResolvedValue(Response.json({ tools: [] }));
+          return "private-data";
+        },
+      },
+    });
+    mocks.run.mockImplementationOnce(async (params) => {
+      await expect(params.tools.search_records.execute({}, {})).rejects.toThrow(
+        /policy|disabled/i,
+      );
+      return success;
+    });
+    await dispatch(f);
+    await f.agent.alarm();
+    expect(mocks.run).toHaveBeenCalledOnce();
+    expect(await reported(f)).toMatchObject({ status: "done" });
+  });
   it("persists and acknowledges dispatch without authority, retrieval, or provider work", async () => {
     const f = fixture();
     expect((await dispatch(f)).status).toBe(202);
@@ -201,7 +254,8 @@ describe("durable child lifecycle", () => {
       payload: { status: "done" },
     });
     await new ResearchSubagent(f.state, f.env).alarm();
-    expect(f.get).toHaveBeenCalledTimes(2);
+    // One policy lookup and a fresh stub for each callback attempt.
+    expect(f.get).toHaveBeenCalledTimes(3);
     expect(mocks.run).toHaveBeenCalledOnce();
     expect(f.values.size).toBe(0);
   });

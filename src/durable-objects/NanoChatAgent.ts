@@ -1,4 +1,13 @@
 import {
+  MEMORY_SOURCE_SCHEMA_SQL,
+  excludeForgottenMemorySources,
+  sourceMessageIdsFromMetadata,
+  excludeMemoryTurn,
+  memoryTurnMessageIds,
+  recordMemorySourceMessages,
+} from "./assistant/memorySources";
+import { listConversationPage } from "./assistant/conversationList";
+import {
   recoverPendingMemoryWrites,
   discardPendingMemoryWrites,
 } from "./assistant/ownedMemory";
@@ -20,7 +29,12 @@ import {
   type LegacyPage,
 } from "./assistant/legacy";
 import { validatePersona } from "./assistant/personaValidation";
-import { validId } from "../utils/validation";
+import {
+  validId,
+  validMemoryId,
+  jsonObject,
+  RequestValidationError,
+} from "../utils/validation";
 import { type ModelMessage, type ToolSet } from "ai";
 import { SpanStatusCode, type Tracer } from "@opentelemetry/api";
 import { createDurableObjectTelemetry } from "../telemetry/durable-object";
@@ -163,20 +177,24 @@ import {
   type WakeProposalInput,
 } from "../services/proactive/outputs";
 import type { SubagentDispatch } from "./ResearchSubagent";
-import { decryptCredentials } from "./assistant/mcpCrypto";
+import { decryptStoredCredentials } from "./assistant/mcpCrypto";
 import {
   discoverMCPTools,
   callMCPTool,
+  mcpServerFingerprint,
+  mcpCatalogBytes,
+  MAX_MCP_TOTAL_CATALOG_BYTES,
   type MCPTool,
   type MCPServerConfig,
 } from "./assistant/mcpClient";
 import {
-  listMemories as agentListMemories,
+  getInventoryMemoriesByIds,
   getMemoriesByIds as agentGetMemoriesByIds,
   buildNamespace as buildMemoryNamespace,
   MAX_LIST_LIMIT as MEMORY_INDEX_MAX_LIST_LIMIT,
   MAX_LIST_OFFSET as MEMORY_INDEX_MAX_LIST_OFFSET,
   type AgentMemoryType,
+  type AgentMemoryMatch,
 } from "../utils/memoryClient";
 import { logInfo, logWarn, logError, logDebug } from "../telemetry/logger";
 import type { Env } from "../types";
@@ -204,6 +222,9 @@ export const SUMMARIZE_JOB_ID = "summarize";
 const MAX_JOBS_PER_ALARM = 8;
 const SUBAGENT_BATCH_TIMEOUT_MS = 5 * 60 * 1000;
 export const DISPATCH_PUMP_LIMIT = 25;
+const DISPATCH_JOB_ID = "subagent_dispatch";
+const DISPATCH_TIMEOUT_MS = 5_000;
+const MAX_DISPATCH_ATTEMPTS = 3;
 function agentFallbackText(finishReason: string | null): string {
   if (finishReason === "tool-calls") {
     return "I tried my best but ran out of steps before producing an answer — the task may be too complex for a single request. Try breaking it into smaller questions, or ask me to focus on one part at a time.";
@@ -592,8 +613,13 @@ export class NanoChatAgent implements DurableObject {
   private systemPrompt: string | null = null;
   private cachedPermissions: UserPermission[] | null = null;
   private mcpToolCache: Map<string, MCPTool[]> = new Map();
+  private mcpConfigurationVersion = 0;
   private lastMessageAt: Map<string, number> = new Map();
   private processingConversations: Set<string> = new Set();
+  private pendingMessages = new Map<
+    string,
+    { requestId?: string; cancelled: boolean }
+  >();
   private activeTurns = new Map<
     string,
     {
@@ -601,10 +627,12 @@ export class NanoChatAgent implements DurableObject {
       messageId: string;
       controller: AbortController;
       text: string;
+      persistedText: string;
       stopped: boolean;
     }
   >();
   private subagentCap = MAX_CONCURRENT_SUBAGENTS;
+  private dispatching = false;
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
     this.env = env;
@@ -678,12 +706,12 @@ export class NanoChatAgent implements DurableObject {
       this.sql.exec(
         "INSERT INTO schema_meta (id, version) VALUES (?, ?)",
         1,
-        10,
+        11,
       );
-      logInfo("NanoChatAgent SQL schema initialized to v10", {
+      logInfo("NanoChatAgent SQL schema initialized to v11", {
         "do.name": "NanoChatAgent",
       });
-      return 10;
+      return 11;
     }
     if (current < 2) {
       this.sql.exec(`
@@ -812,6 +840,11 @@ CREATE TABLE IF NOT EXISTS context (
       this.sql.exec(MEMORY_INDEX_SCHEMA_SQL);
       this.sql.exec("UPDATE schema_meta SET version = ? WHERE id = ?", 10, 1);
       current = 10;
+    }
+    if (current < 11) {
+      this.sql.exec(MEMORY_SOURCE_SCHEMA_SQL);
+      this.sql.exec("UPDATE schema_meta SET version = ? WHERE id = ?", 11, 1);
+      current = 11;
     }
     return current;
   }
@@ -1180,6 +1213,7 @@ CREATE TABLE IF NOT EXISTS context (
                   this.context.tenant_binding,
                 );
                 signal?.throwIfAborted();
+                this.assertToolAvailable(id);
                 return definition.execute!(...args);
               },
             }
@@ -1187,11 +1221,53 @@ CREATE TABLE IF NOT EXISTS context (
       ]),
     ) as ToolSet;
   }
+  private assertToolAvailable(id: string): void {
+    if (!this.context) throw new Error("Agent not initialized");
+    const settings = this.getPersonaSettings(this.context.user_id);
+    if (
+      settings.disabledTools?.includes(id) ||
+      (settings.enabledTools?.length && !settings.enabledTools.includes(id)) ||
+      (id === "search_memory" && !settings.memoryEnabled)
+    )
+      throw new Error("Tool is disabled by the current persona policy");
+  }
+  private allowedResearchToolIds(): string[] {
+    return SUBAGENT_TOOL_IDS.filter((id) => {
+      try {
+        this.assertToolAvailable(id);
+        return true;
+      } catch {
+        return false;
+      }
+    });
+  }
+  private isCurrentMcpServer(
+    server: MCPServerConfig,
+    version: number,
+  ): boolean {
+    if (!this.context || version !== this.mcpConfigurationVersion) return false;
+    const row = this.getPersonaRow(this.context.user_id);
+    const entries =
+      parsePersonaList(row?.mcp_servers, "mcp_servers", this.context.user_id) ??
+      [];
+    return entries.some((entry) => {
+      try {
+        return (
+          mcpServerFingerprint(entry as MCPServerConfig) ===
+          mcpServerFingerprint(server)
+        );
+      } catch {
+        return false;
+      }
+    });
+  }
   private async buildMcpTools(
     conversationId?: string,
   ): Promise<Map<string, unknown>> {
     const out = new Map<string, unknown>();
     if (!this.context) return out;
+    const configurationVersion = this.mcpConfigurationVersion;
+    let catalogBytes = 0;
     const personaRow = this.getPersonaRow(this.context.user_id);
     const rawServers =
       parsePersonaList(
@@ -1234,9 +1310,15 @@ CREATE TABLE IF NOT EXISTS context (
       let decryptedHeaders: Record<string, string> | undefined;
       if (server.headers_encrypted) {
         try {
-          decryptedHeaders = await decryptCredentials(
+          decryptedHeaders = await decryptStoredCredentials(
             this.env,
             server.headers_encrypted,
+            {
+              userId: this.context.user_id,
+              workspaceId: this.context.tenant_binding,
+              serverName: server.name,
+              serverUrl: server.url,
+            },
           );
         } catch (error) {
           logWarn("Failed to decrypt MCP credentials — skipping server", {
@@ -1247,7 +1329,9 @@ CREATE TABLE IF NOT EXISTS context (
           continue;
         }
       }
-      let tools = this.mcpToolCache.get(server.name);
+      if (!this.isCurrentMcpServer(server, configurationVersion)) continue;
+      const fingerprint = mcpServerFingerprint(server);
+      let tools = this.mcpToolCache.get(fingerprint);
       if (!tools) {
         try {
           tools = await discoverMCPTools({
@@ -1256,7 +1340,8 @@ CREATE TABLE IF NOT EXISTS context (
             decryptedHeaders,
             timeoutMs: 5000,
           });
-          this.mcpToolCache.set(server.name, tools);
+          if (!this.isCurrentMcpServer(server, configurationVersion)) continue;
+          this.mcpToolCache.set(fingerprint, tools);
         } catch (error) {
           logWarn("MCP discovery failed — skipping server", {
             "do.name": "NanoChatAgent",
@@ -1266,6 +1351,14 @@ CREATE TABLE IF NOT EXISTS context (
           continue;
         }
       }
+      const serverBytes = mcpCatalogBytes(tools);
+      if (catalogBytes + serverBytes > MAX_MCP_TOTAL_CATALOG_BYTES) {
+        logWarn("MCP catalog exceeds combined byte limit — skipping server", {
+          "mcp.server": server.name,
+        });
+        continue;
+      }
+      catalogBytes += serverBytes;
       for (const tool of tools) {
         const assembled = createMcpTool(
           {
@@ -1279,12 +1372,30 @@ CREATE TABLE IF NOT EXISTS context (
                   this.context.user_id,
                   this.context.tenant_binding,
                 );
+                this.assertToolAvailable(assembled.toolId);
+                if (!this.isCurrentMcpServer(server, configurationVersion))
+                  throw new Error(
+                    "MCP server configuration changed; request fresh approval",
+                  );
                 const result = await callMCPTool({
                   env: this.env,
                   server,
                   decryptedHeaders,
                   tool_name: tool.name,
                   tool_args: input,
+                  beforeCall: async () => {
+                    if (!this.context) throw new Error("Agent not initialized");
+                    await authorizePrincipal(
+                      this.env,
+                      this.context.user_id,
+                      this.context.tenant_binding,
+                    );
+                    this.assertToolAvailable(assembled.toolId);
+                    if (!this.isCurrentMcpServer(server, configurationVersion))
+                      throw new Error(
+                        "MCP server configuration changed; request fresh approval",
+                      );
+                  },
                 });
                 return typeof result === "string"
                   ? result
@@ -1297,12 +1408,15 @@ CREATE TABLE IF NOT EXISTS context (
           {
             confirmations: makeSqliteConfirmationCoordinator(this.sql),
             conversationId,
+            confirmationScope: JSON.stringify([fingerprint, tool]),
           },
         );
         out.set(assembled.toolId, assembled.tool);
       }
     }
-    return out;
+    return configurationVersion === this.mcpConfigurationVersion
+      ? out
+      : new Map();
   }
   private async ensureSystemPrompt(conversationId?: string): Promise<string> {
     if (!this.context) throw new Error("Agent not initialized");
@@ -1404,6 +1518,20 @@ CREATE TABLE IF NOT EXISTS context (
     if (url.pathname === "/memory-filter" && request.method === "POST") {
       return this.handleMemoryFilter(request);
     }
+    if (url.pathname === "/tool-policy" && request.method === "GET") {
+      if (!this.context)
+        return Response.json({ error: "Unauthorized" }, { status: 401 });
+      try {
+        await authorizePrincipal(
+          this.env,
+          this.context.user_id,
+          this.context.tenant_binding,
+        );
+        return Response.json({ tools: this.allowedResearchToolIds() });
+      } catch {
+        return Response.json({ error: "Unauthorized" }, { status: 401 });
+      }
+    }
     if (url.pathname === "/memories" && request.method === "GET") {
       return this.handleListMemories(url);
     }
@@ -1412,7 +1540,15 @@ CREATE TABLE IF NOT EXISTS context (
     }
     const memoryDeleteMatch = url.pathname.match(/^\/memories\/([^/]+)$/);
     if (memoryDeleteMatch && request.method === "DELETE") {
-      return this.handleDeleteMemory(memoryDeleteMatch[1]);
+      let memoryId: string;
+      try {
+        memoryId = decodeURIComponent(memoryDeleteMatch[1]);
+      } catch {
+        return Response.json({ error: "Memory not found" }, { status: 404 });
+      }
+      if (!validMemoryId(memoryId))
+        return Response.json({ error: "Memory not found" }, { status: 404 });
+      return this.handleDeleteMemory(memoryId);
     }
     if (url.pathname === "/conversations" && request.method === "GET") {
       return this.handleListConversations(url);
@@ -1509,7 +1645,7 @@ CREATE TABLE IF NOT EXISTS context (
         this.context.tenant_binding !== identity.tenantBinding)
     )
       return Response.json({ error: "Identity mismatch" }, { status: 403 });
-    const data = (await request.json()) as {
+    const data = jsonObject(await request.json()) as {
       conversation_id?: string;
       pageContext?: string;
     };
@@ -1562,10 +1698,15 @@ CREATE TABLE IF NOT EXISTS context (
     }
     if (request.method === "PUT") {
       try {
-        const body = (await validatePersona(
-          await request.json(),
-          this.env,
-        )) as Partial<{
+        const body = (await validatePersona(await request.json(), this.env, {
+          userId,
+          workspaceId: this.context.tenant_binding,
+          existingServers: (parsePersonaList(
+            this.getPersonaRow(userId)?.mcp_servers,
+            "mcp_servers",
+            userId,
+          ) ?? []) as MCPServerConfig[],
+        })) as Partial<{
           identity_override: string | null;
           persona: string | null;
           enabled_tools: string[] | null;
@@ -1721,6 +1862,7 @@ CREATE TABLE IF NOT EXISTS context (
         }
         this.systemPrompt = null;
         this.mcpToolCache.clear();
+        this.mcpConfigurationVersion++;
         if (body.wake_interval_minutes !== undefined) {
           await this.applyWakeScheduleChange(
             isWakeIntervalMinutes(next.wake_interval_minutes)
@@ -1740,13 +1882,31 @@ CREATE TABLE IF NOT EXISTS context (
           persona: this.personaRowToJson(this.getPersonaRow(userId)),
         });
       } catch (error) {
-        return Response.json({ error: String(error) }, { status: 500 });
+        return Response.json(
+          {
+            error:
+              error instanceof RequestValidationError
+                ? error.message
+                : error instanceof SyntaxError
+                  ? "Invalid JSON"
+                  : "Persona update failed",
+          },
+          {
+            status:
+              error instanceof RequestValidationError
+                ? error.status
+                : error instanceof SyntaxError
+                  ? 400
+                  : 500,
+          },
+        );
       }
     }
     if (request.method === "DELETE") {
       this.sql.exec("DELETE FROM persona WHERE user_id = ?", userId);
       this.systemPrompt = null;
       this.mcpToolCache.clear();
+      this.mcpConfigurationVersion++;
       await this.applyWakeScheduleChange(null);
       this.invalidatePendingMemory();
       await this.applyDreamScheduleChange();
@@ -1783,21 +1943,100 @@ CREATE TABLE IF NOT EXISTS context (
       MEMORY_INDEX_MAX_LIST_LIMIT,
     );
     const cursor = url.searchParams.get("cursor");
-    const offset = cursor
-      ? Math.min(
-          Math.max(parseInt(cursor, 10) || 0, 0),
-          MEMORY_INDEX_MAX_LIST_OFFSET,
-        )
-      : 0;
+    let offset = 0;
+    let position: [number, string] | null = null;
+    if (cursor) {
+      if (/^\d+$/.test(cursor))
+        offset = Math.min(Number(cursor), MEMORY_INDEX_MAX_LIST_OFFSET);
+      else
+        try {
+          if (cursor.length > 1024) throw new Error();
+          const value = JSON.parse(atob(cursor));
+          if (
+            !Array.isArray(value) ||
+            value.length !== 2 ||
+            !Number.isSafeInteger(value[0]) ||
+            typeof value[1] !== "string" ||
+            !value[1] ||
+            value[1].length > 256
+          )
+            throw new Error();
+          position = value as [number, string];
+        } catch {
+          return Response.json({ error: "Invalid cursor" }, { status: 400 });
+        }
+    }
     try {
-      const { matches, total_returned } = await agentListMemories(this.env, {
+      const filters = [
+        "deleting_at IS NULL",
+        "(type != 'insight' OR tier='warm')",
+        "NOT EXISTS (SELECT 1 FROM memory_tombstones WHERE memory_tombstones.vector_id=memory_index.vector_id)",
+        "NOT EXISTS (SELECT 1 FROM memory_pending_writes WHERE memory_pending_writes.vector_id=memory_index.vector_id)",
+      ];
+      const bindings: unknown[] = [];
+      if (typeFilter?.length) {
+        filters.push(`type IN (${typeFilter.map(() => "?").join(",")})`);
+        bindings.push(...typeFilter);
+      }
+      if (conversationId) {
+        filters.push("conversation_id=?");
+        bindings.push(conversationId);
+      }
+      if (position) {
+        filters.push("(created_at<? OR (created_at=? AND vector_id>?))");
+        bindings.push(position[0], position[0], position[1]);
+      }
+      const where = filters.join(" AND ");
+      const rows = this.sql
+        .exec(
+          `SELECT vector_id,created_at,type,conversation_id,content FROM memory_index WHERE ${where} ORDER BY created_at DESC,vector_id ASC LIMIT ? OFFSET ?`,
+          ...bindings,
+          limit + 1,
+          offset,
+        )
+        .toArray() as Array<{
+        vector_id: string;
+        created_at: number;
+        type: AgentMemoryType;
+        conversation_id: string | null;
+        content: string;
+      }>;
+      const page = rows.slice(0, limit);
+      const ids = page.map((row) => row.vector_id);
+      const inventory = await getInventoryMemoriesByIds(this.env, {
         user_id: this.context.user_id,
         tenant_binding: this.context.tenant_binding,
-        typeFilter,
-        conversation_id: conversationId,
-        offset,
-        limit,
+        ids,
       });
+      const byId = new Map(
+        inventory.map((memory) => [memory.vector_id, memory]),
+      );
+      // Archived imports may only have owner-local SQL content. Keep those
+      // records manageable without promoting them into semantic recall.
+      const matches: AgentMemoryMatch[] = page.map(
+        (row) =>
+          byId.get(row.vector_id) ?? {
+            vector_id: row.vector_id,
+            score: 1,
+            weighted_score: 1,
+            metadata: {
+              vector_id: row.vector_id,
+              type: row.type,
+              content_preview: row.content,
+              user_id: this.context!.user_id,
+              tenant_binding: this.context!.tenant_binding,
+              tenant_id: this.context!.tenant_binding,
+              user_namespace: buildMemoryNamespace(
+                this.context!.user_id,
+                this.context!.tenant_binding,
+              ),
+              ...(row.conversation_id
+                ? { conversation_id: row.conversation_id }
+                : {}),
+              created_at: row.created_at,
+            },
+          },
+      );
       const visibleIds = new Set(
         filterListMemoryIds(
           this.sql,
@@ -1849,11 +2088,10 @@ CREATE TABLE IF NOT EXISTS context (
             source_count: sourceCount,
           };
         });
-      const nextOffset = offset + matches.length;
+      const last = page.at(-1);
       const next_cursor =
-        nextOffset < total_returned &&
-        nextOffset <= MEMORY_INDEX_MAX_LIST_OFFSET
-          ? String(nextOffset)
+        rows.length > limit && last
+          ? btoa(JSON.stringify([last.created_at, last.vector_id]))
           : null;
       return Response.json({ success: true, memories, next_cursor });
     } catch (err) {
@@ -1910,7 +2148,12 @@ CREATE TABLE IF NOT EXISTS context (
         return Response.json({ error: "Forbidden" }, { status: 403 });
       }
       this.invalidatePendingMemory();
-      const deleteIds = planMemoryDeletion(this.sql, [vectorId]);
+      const deleteIds = planMemoryDeletion(
+        this.sql,
+        excludeForgottenMemorySources(this.sql, [vectorId], {
+          [vectorId]: sourceMessageIdsFromMetadata(record?.metadata.extra),
+        }),
+      );
       markMemoriesForDeletion(this.sql, deleteIds);
       this.queueMemoryDeletionCleanup();
       if (!this.env.MEMORY_INDEX)
@@ -1992,9 +2235,20 @@ CREATE TABLE IF NOT EXISTS context (
     this.queueMemoryDeletionCleanup();
     try {
       await completeForgetAllLegacyListing({ sql: this.sql, env: this.env });
+      if (
+        this.sql
+          .exec(
+            "SELECT legacy_list_complete FROM memory_forget_state WHERE id=1",
+          )
+          .toArray()[0]?.legacy_list_complete === 0
+      )
+        return Response.json(
+          { success: true, pending: true, deleted: 0 },
+          { status: 202 },
+        );
       const rows = this.sql
         .exec(
-          "SELECT vector_id, deleting_at FROM memory_index WHERE deleting_at IS NOT NULL",
+          "SELECT vector_id, deleting_at FROM memory_index WHERE deleting_at IS NOT NULL ORDER BY deleting_at, vector_id LIMIT 100",
         )
         .toArray() as unknown as Array<{
         vector_id: string;
@@ -2049,11 +2303,11 @@ CREATE TABLE IF NOT EXISTS context (
       if (!finishForgetAllIfComplete(this.sql)) {
         return Response.json(
           {
-            error: "Memory deletion is still pending. Please retry.",
+            success: true,
+            pending: true,
             deleted,
-            retryable: true,
           },
-          { status: 500 },
+          { status: 202 },
         );
       }
       logInfo("Forget-all complete", {
@@ -2074,31 +2328,7 @@ CREATE TABLE IF NOT EXISTS context (
     }
   }
   private handleListConversations(url: URL): Response {
-    const limitParam = parseInt(
-      url.searchParams.get("limit") || `${DEFAULT_CONVERSATION_LIMIT}`,
-      10,
-    );
-    const limit = Math.min(
-      Number.isFinite(limitParam) && limitParam > 0
-        ? limitParam
-        : DEFAULT_CONVERSATION_LIMIT,
-      100,
-    );
-    const cursor = this.sql.exec(
-      `SELECT * FROM conversations ORDER BY last_active_at DESC LIMIT ?`,
-      limit,
-    );
-    const rows = cursor.toArray() as unknown as ConversationRow[];
-    return Response.json({
-      success: true,
-      conversations: rows.map((r) => ({
-        conversation_id: r.conversation_id,
-        title: r.title,
-        created_at: r.created_at,
-        last_active_at: r.last_active_at,
-        message_count: r.message_count,
-      })),
-    });
+    return listConversationPage(this.sql, url);
   }
   private handleGetConversation(conversationId: string): Response {
     const row = this.getConversationRow(conversationId);
@@ -2548,11 +2778,12 @@ CREATE TABLE IF NOT EXISTS context (
         request_id: active.requestId,
         message_id: active.messageId,
       });
-      if (active.text)
+      const pendingText = active.text.slice(active.persistedText.length);
+      if (pendingText)
         this.sendWS(server, {
           type: "assistant_delta",
           request_id: active.requestId,
-          content: active.text,
+          content: pendingText,
         });
     }
     const activeBatches = this.sql
@@ -2592,6 +2823,7 @@ CREATE TABLE IF NOT EXISTS context (
     conversationId: string;
     assistantMessageId: string | null;
     memoryEnabled: boolean;
+    memoryEpoch: number;
     userMessage: string;
     fullText: string;
     finishReason: string | null;
@@ -2602,14 +2834,24 @@ CREATE TABLE IF NOT EXISTS context (
     }>;
   }): Promise<void> {
     if (!this.context) return;
+    if (args.memoryEpoch !== this.memoryWriteEpoch) {
+      if (args.assistantMessageId)
+        excludeMemoryTurn(
+          this.sql,
+          args.conversationId,
+          args.assistantMessageId,
+        );
+      return;
+    }
     if (!args.memoryEnabled) return;
     if (!args.fullText) return;
-    const epoch = this.memoryWriteEpoch;
+    const epoch = args.memoryEpoch;
     const stillValid = () =>
       this.memoryWriteEpoch === epoch &&
       !!this.context &&
       this.getPersonaSettings(this.context.user_id).memoryEnabled &&
       !!this.getConversationRow(args.conversationId);
+    if (!stillValid()) return;
     const isFallbackText = CANNED_FALLBACK_MESSAGES.has(args.fullText.trim());
     const shouldWriteRaw =
       args.finishReason === "stop" &&
@@ -2657,6 +2899,15 @@ CREATE TABLE IF NOT EXISTS context (
             stillValid: rawStillValid,
             onDeletionPending: () => this.queueMemoryDeletionCleanup(),
             onCommit: (vectorId) => {
+              recordMemorySourceMessages(
+                this.sql,
+                vectorId,
+                memoryTurnMessageIds(
+                  this.sql,
+                  args.conversationId,
+                  args.assistantMessageId!,
+                ),
+              );
               this.sql.exec(
                 "UPDATE messages SET vector_id = ? WHERE message_id = ? AND conversation_id = ? AND role = 'assistant'",
                 vectorId,
@@ -2697,6 +2948,11 @@ CREATE TABLE IF NOT EXISTS context (
           result_count:
             typeof resultCount === "number" ? resultCount : undefined,
           stillValid,
+          source_message_ids: memoryTurnMessageIds(
+            this.sql,
+            args.conversationId,
+            args.assistantMessageId ?? undefined,
+          ),
           onDeletionPending: () => this.queueMemoryDeletionCleanup(),
         });
       } catch (err) {
@@ -2712,6 +2968,9 @@ CREATE TABLE IF NOT EXISTS context (
     requestId?: string,
     discard = false,
   ): void {
+    const pending = this.pendingMessages.get(conversationId);
+    if (pending && (!requestId || pending.requestId === requestId))
+      pending.cancelled = true;
     const active = this.activeTurns.get(conversationId);
     if (active && (!requestId || active.requestId === requestId)) {
       active.controller.abort();
@@ -2721,7 +2980,7 @@ CREATE TABLE IF NOT EXISTS context (
           messageId: active.messageId,
           conversationId,
           role: "assistant",
-          content: `${active.text}\n\n_(Stopped)_`,
+          content: `${active.text.slice(active.persistedText.length)}\n\n_(Stopped)_`,
         });
       }
       this.activeTurns.delete(conversationId);
@@ -2909,6 +3168,21 @@ CREATE TABLE IF NOT EXISTS context (
         return;
       }
       if (["message", "clear", "cancel"].includes(data.type)) {
+        const pending =
+          data.type === "message"
+            ? { requestId: data.request_id, cancelled: false }
+            : undefined;
+        if (pending) {
+          if (this.pendingMessages.has(socketCtx.conversation_id)) {
+            this.sendWS(ws, {
+              type: "error",
+              request_id: data.request_id,
+              error: "Still processing previous message. Please wait.",
+            });
+            return;
+          }
+          this.pendingMessages.set(socketCtx.conversation_id, pending);
+        }
         try {
           const principal = await authorizePrincipal(
             this.env,
@@ -2916,6 +3190,7 @@ CREATE TABLE IF NOT EXISTS context (
             this.context.tenant_binding,
           );
           this.context.user_role = principal.role;
+          if (pending?.cancelled) return;
         } catch {
           this.sendWS(ws, {
             type: "error",
@@ -2924,6 +3199,12 @@ CREATE TABLE IF NOT EXISTS context (
           });
           ws.close(1008, "Unauthorized");
           return;
+        } finally {
+          if (
+            pending &&
+            this.pendingMessages.get(socketCtx.conversation_id) === pending
+          )
+            this.pendingMessages.delete(socketCtx.conversation_id);
         }
       }
       switch (data.type) {
@@ -3018,6 +3299,7 @@ CREATE TABLE IF NOT EXISTS context (
       return;
     }
     this.processingConversations.add(conversationId);
+    const memoryEpoch = this.memoryWriteEpoch;
     const requestId =
       typeof rawRequestId === "string" &&
       /^[a-zA-Z0-9_-]{1,128}$/.test(rawRequestId)
@@ -3028,9 +3310,59 @@ CREATE TABLE IF NOT EXISTS context (
       messageId: crypto.randomUUID(),
       controller: new AbortController(),
       text: "",
+      persistedText: "",
       stopped: false,
     };
     this.activeTurns.set(conversationId, activeTurn);
+    let persistedMessages = 0;
+    let lastAssistantMessageId: string | null = null;
+    const journaledTools = new Map<
+      string,
+      { assistantId: string; resultId: string }
+    >();
+    const remainingProviderMessages = (
+      messages: ModelMessage[],
+    ): ModelMessage[] =>
+      messages.flatMap((message): ModelMessage[] => {
+        if (!Array.isArray(message.content)) return [message];
+        if (message.role === "assistant") {
+          const content = message.content.filter((part) => {
+            if (part.type !== "tool-call") return true;
+            const journal = journaledTools.get(part.toolCallId);
+            if (!journal) return true;
+            // A signature can arrive after the initial tool-call delta. Keep
+            // the final provider metadata on the already reserved call row.
+            this.sql.exec(
+              "UPDATE messages SET tool_calls = ? WHERE message_id = ? AND conversation_id = ?",
+              JSON.stringify([part]),
+              journal.assistantId,
+              conversationId,
+            );
+            return false;
+          });
+          return content.some(
+            (part) => part.type === "text" || part.type === "tool-call",
+          )
+            ? [{ ...message, content }]
+            : [];
+        }
+        if (message.role === "tool") {
+          const content = message.content.filter((part) => {
+            if (part.type !== "tool-result") return true;
+            const journal = journaledTools.get(part.toolCallId);
+            if (!journal) return true;
+            this.sql.exec(
+              "UPDATE messages SET content = ? WHERE message_id = ? AND conversation_id = ?",
+              JSON.stringify(part.output),
+              journal.resultId,
+              conversationId,
+            );
+            return false;
+          });
+          return content.length ? [{ ...message, content }] : [];
+        }
+        return [message];
+      });
     const startTime = Date.now();
     const telemetry = createDurableObjectTelemetry(
       this.env,
@@ -3097,6 +3429,79 @@ CREATE TABLE IF NOT EXISTS context (
         telemetryTag: "agent",
         reasoningEffort: personaSettings.reasoningEffort,
         abortSignal: activeTurn.controller.signal,
+        onToolStart: (message) => {
+          activeTurn.controller.signal.throwIfAborted();
+          if (!this.getConversationRow(conversationId))
+            throw new Error("Conversation no longer exists");
+          if (message.role !== "assistant" || !Array.isArray(message.content))
+            return;
+          const call = message.content.find(
+            (part) => part.type === "tool-call",
+          );
+          if (
+            !call ||
+            call.type !== "tool-call" ||
+            journaledTools.has(call.toolCallId)
+          )
+            return;
+          const assistantId = this.appendMessage({
+            conversationId,
+            role: "assistant",
+            content: "",
+            toolCalls: [call],
+          });
+          const resultId = this.appendMessage({
+            conversationId,
+            role: "tool",
+            toolCallId: call.toolCallId,
+            toolName: call.toolName,
+            content: JSON.stringify({
+              type: "text",
+              value:
+                "Execution started; completion has not been confirmed. Do not assume it had no effects.",
+            }),
+          });
+          journaledTools.set(call.toolCallId, { assistantId, resultId });
+        },
+        onToolComplete: (toolCallId, output) => {
+          const journal = journaledTools.get(toolCallId);
+          if (!journal) return;
+          // Stop may release this conversation for another turn while an
+          // external effect is finishing. Update its original placeholder;
+          // clear/delete remove that row, so late work cannot recreate it.
+          this.sql.exec(
+            "UPDATE messages SET content = ? WHERE message_id = ? AND conversation_id = ?",
+            JSON.stringify(output),
+            journal.resultId,
+            conversationId,
+          );
+        },
+        retainToolExecution: (execution) => this.state.waitUntil(execution),
+        onStepComplete: (messages) => {
+          if (
+            activeTurn.controller.signal.aborted ||
+            !this.getConversationRow(conversationId)
+          )
+            return;
+          const completed = remainingProviderMessages(
+            messages.slice(persistedMessages),
+          );
+          lastAssistantMessageId =
+            this.history.appendTurnMessages(conversationId, completed, "") ??
+            lastAssistantMessageId;
+          persistedMessages = messages.length;
+          activeTurn.persistedText += completed
+            .filter((message) => message.role === "assistant")
+            .map((message) =>
+              typeof message.content === "string"
+                ? message.content
+                : message.content
+                    .filter((part) => part.type === "text")
+                    .map((part) => part.text)
+                    .join(""),
+            )
+            .join("");
+        },
         emit: (frame) => {
           if (activeTurn.controller.signal.aborted) return;
           if (frame.type === "assistant_delta")
@@ -3121,11 +3526,14 @@ CREATE TABLE IF NOT EXISTS context (
       const fullText = turn.fullText;
       const finishReason = turn.finishReason;
       const durationMs = Date.now() - startTime;
-      const assistantMessageId = this.history.appendTurnMessages(
-        conversationId,
-        turn.responseMessages,
-        fullText,
-      );
+      const assistantMessageId =
+        this.history.appendTurnMessages(
+          conversationId,
+          remainingProviderMessages(
+            turn.responseMessages.slice(persistedMessages),
+          ),
+          fullText.slice(activeTurn.persistedText.length),
+        ) ?? lastAssistantMessageId;
       this.activeTurns.delete(conversationId);
       this.processingConversations.delete(conversationId);
       this.sendToConversation(conversationId, {
@@ -3153,6 +3561,7 @@ CREATE TABLE IF NOT EXISTS context (
         }
       }
       const memoryPersistencePromise = this.persistMemoryForTurn({
+        memoryEpoch,
         conversationId,
         assistantMessageId,
         memoryEnabled,
@@ -3230,7 +3639,9 @@ CREATE TABLE IF NOT EXISTS context (
           .join("");
         this.history.appendTurnMessages(
           conversationId,
-          partial.responseMessages,
+          remainingProviderMessages(
+            partial.responseMessages.slice(persistedMessages),
+          ),
           "",
         );
         const missingText = partial.text.startsWith(representedText)
@@ -3493,6 +3904,9 @@ CREATE TABLE IF NOT EXISTS context (
       }
       case "subagent_cancel":
         return this.drainSubagentCancellations();
+      case "subagent_dispatch":
+        await this.pumpDispatch();
+        return;
       case "housekeeping_cleanup": {
         const payload = JSON.parse(job.payload_json ?? "{}") as {
           taskId?: string;
@@ -3515,6 +3929,14 @@ CREATE TABLE IF NOT EXISTS context (
             })
           )
             deleteJob(this.sql, job.job_id);
+          else
+            scheduleJob(this.sql, {
+              job_id: job.job_id,
+              kind: "housekeeping_cleanup",
+              payload,
+              run_at: Date.now() + 1000,
+              now: Date.now(),
+            });
         } else {
           await cleanupDreamResult({
             sql: this.sql,
@@ -3782,6 +4204,15 @@ CREATE TABLE IF NOT EXISTS context (
       stillValid: () => stillValid() && this.isHousekeepingTaskValid(task),
       onDeletionPending: () => this.queueMemoryDeletionCleanup(),
       onCommit: (vectorId) => {
+        recordMemorySourceMessages(
+          this.sql,
+          vectorId,
+          memoryTurnMessageIds(
+            this.sql,
+            task.conversation_id!,
+            payload.message_id,
+          ),
+        );
         this.sql.exec(
           "UPDATE messages SET vector_id = ? WHERE message_id = ? AND conversation_id = ?",
           vectorId,
@@ -4151,6 +4582,13 @@ CREATE TABLE IF NOT EXISTS context (
         }),
       now: startedAt,
     });
+    // A settings request can replace or cancel the next wake during triage.
+    // That newer schedule owns the cadence; an old pass must not overwrite it.
+    if (
+      isProactiveDisabled(this.env) ||
+      this.getWakeIntervalMinutes(userId) !== interval
+    )
+      return;
     const now = Date.now();
     const nextRunAt = computeNextWakeAt(now, interval);
     scheduleJob(this.sql, {
@@ -4322,6 +4760,13 @@ CREATE TABLE IF NOT EXISTS context (
         });
       }
     }
+    // A dispatch may have persisted its claim before the network request or
+    // acknowledgement. The child accepts retries by task ID without replacing
+    // its work/report, so reconstruction can safely resume that delivery.
+    this.sql.exec(
+      "UPDATE subagent_tasks SET started_at = NULL WHERE status = 'dispatched'",
+    );
+    this.scheduleDispatchPump();
     if (
       this.sql
         .exec("SELECT task_id FROM subagent_cancellations LIMIT 1")
@@ -4444,6 +4889,11 @@ CREATE TABLE IF NOT EXISTS context (
     if (args.tasks.length === 0) {
       return { batch_id, queued: 0 };
     }
+    const researchToolIds = this.allowedResearchToolIds();
+    if (researchToolIds.length === 0)
+      throw new Error(
+        "No research tools are enabled by the current persona policy",
+      );
     const admitted = this.state.storage.transactionSync(() => {
       if (args.origin === "wake") {
         if (!args.wake_run_id)
@@ -4488,7 +4938,7 @@ CREATE TABLE IF NOT EXISTS context (
         batch_id,
         origin: args.origin,
         conversation_id: args.conversation_id,
-        toolset: [...SUBAGENT_TOOL_IDS],
+        toolset: researchToolIds,
         deadline_at,
         now,
         tasks: args.tasks.map((t) => ({
@@ -4502,6 +4952,12 @@ CREATE TABLE IF NOT EXISTS context (
         kind: "batch_deadline",
         run_at: deadline_at,
         payload: { batch_id },
+        now,
+      });
+      scheduleJob(this.sql, {
+        job_id: DISPATCH_JOB_ID,
+        kind: "subagent_dispatch",
+        run_at: now,
         now,
       });
       if (args.origin === "wake") {
@@ -4537,7 +4993,59 @@ CREATE TABLE IF NOT EXISTS context (
     });
     return { batch_id, queued: args.tasks.length };
   }
+  private scheduleDispatchPump(): void {
+    const now = Date.now();
+    const pending = this.sql
+      .exec(
+        `SELECT status, MIN(COALESCE(started_at, 0)) AS started_at,
+                MIN(deadline_at) AS deadline_at FROM subagent_tasks
+         WHERE status IN ('queued', 'dispatched') GROUP BY status`,
+      )
+      .toArray();
+    if (!pending.length) {
+      deleteJob(this.sql, DISPATCH_JOB_ID);
+      return;
+    }
+    const inFlight = Number(
+      this.sql
+        .exec(
+          "SELECT COUNT(*) AS count FROM subagent_tasks WHERE status IN ('dispatched', 'running')",
+        )
+        .toArray()[0].count,
+    );
+    const next = Math.min(
+      ...pending.map((task) =>
+        task.status === "queued"
+          ? inFlight < this.subagentCap
+            ? now + 1000
+            : Number(task.deadline_at)
+          : Math.min(
+              Number(task.deadline_at),
+              task.started_at === null
+                ? now
+                : Number(task.started_at) + BATCH_RETRY_MS,
+            ),
+      ),
+    );
+    scheduleJob(this.sql, {
+      job_id: DISPATCH_JOB_ID,
+      kind: "subagent_dispatch",
+      run_at: Math.max(now, next),
+      now,
+    });
+  }
   private async pumpDispatch(): Promise<number> {
+    if (!this.context || this.dispatching) return 0;
+    this.dispatching = true;
+    try {
+      return await this.runDispatchPump();
+    } finally {
+      this.dispatching = false;
+      this.scheduleDispatchPump();
+      await this.rearmAlarm();
+    }
+  }
+  private async runDispatchPump(): Promise<number> {
     if (!this.context) return 0;
     const ctx = this.context;
     const coordinator_do_name = doName(ctx.user_id, ctx.tenant_binding);
@@ -4545,15 +5053,53 @@ CREATE TABLE IF NOT EXISTS context (
     let attempts = 0;
     const touchedBatches = new Set<string>();
     while (attempts < DISPATCH_PUMP_LIMIT) {
-      const claimed = claimSlots(this.sql, {
-        cap: this.subagentCap,
-        limit: DISPATCH_PUMP_LIMIT - attempts,
-        now: Date.now(),
+      const now = Date.now();
+      const retrying = this.sql
+        .exec(
+          `SELECT * FROM subagent_tasks WHERE status = 'dispatched'
+           AND (started_at IS NULL OR started_at <= ?)
+           ORDER BY created_at, task_id LIMIT ?`,
+          now - BATCH_RETRY_MS,
+          DISPATCH_PUMP_LIMIT - attempts,
+        )
+        .toArray() as unknown as SubagentTask[];
+      const deliverable = retrying.filter((task) => {
+        if (task.attempt < MAX_DISPATCH_ATTEMPTS) return true;
+        settleTask(this.sql, {
+          task_id: task.task_id,
+          status: task.deadline_at <= now ? "timeout" : "failed",
+          error:
+            "Dispatch attempts exhausted; the last delivery was not confirmed",
+          now,
+        });
+        touchedBatches.add(task.batch_id);
+        attempts++;
+        return false;
       });
+      const claimed = [
+        ...deliverable,
+        ...claimSlots(this.sql, {
+          cap: this.subagentCap,
+          limit: DISPATCH_PUMP_LIMIT - attempts - deliverable.length,
+          now,
+        }),
+      ];
       if (claimed.length === 0) break;
       attempts += claimed.length;
+      for (const task of claimed)
+        this.sql.exec(
+          "UPDATE subagent_tasks SET attempt = attempt + 1, started_at = ? WHERE task_id = ? AND status = 'dispatched'",
+          now,
+          task.task_id,
+        );
+      // Recovery exists before dispatch leaves this object. A timer alone is
+      // insufficient because it disappears on reconstruction.
+      this.scheduleDispatchPump();
+      await this.rearmAlarm();
       const results = await Promise.allSettled(
         claimed.map(async (task) => {
+          if (task.deadline_at <= Date.now())
+            throw new Error("Task deadline passed before dispatch");
           const dispatch: SubagentDispatch = {
             task_id: task.task_id,
             batch_id: task.batch_id,
@@ -4583,13 +5129,35 @@ CREATE TABLE IF NOT EXISTS context (
             },
             this.env.INTERNAL_AUTH_SECRET,
           );
-          const res = await stub.fetch(
-            new Request("https://do/dispatch", {
-              method: "POST",
-              headers,
-              body: JSON.stringify(dispatch),
-            }),
-          );
+          const controller = new AbortController();
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          let res: Response;
+          try {
+            res = await Promise.race([
+              stub.fetch(
+                new Request("https://do/dispatch", {
+                  method: "POST",
+                  headers,
+                  body: JSON.stringify(dispatch),
+                  signal: controller.signal,
+                }),
+              ),
+              new Promise<never>((_, reject) => {
+                timer = setTimeout(
+                  () => {
+                    controller.abort();
+                    reject(new Error("Child dispatch timed out"));
+                  },
+                  Math.min(
+                    DISPATCH_TIMEOUT_MS,
+                    Math.max(1, task.deadline_at - Date.now()),
+                  ),
+                );
+              }),
+            ]);
+          } finally {
+            clearTimeout(timer);
+          }
           if (!res.ok)
             throw new Error(`Dispatch rejected with status ${res.status}`);
           return task.task_id;
@@ -4600,18 +5168,26 @@ CREATE TABLE IF NOT EXISTS context (
         const task = claimed[i];
         touchedBatches.add(task.batch_id);
         if (result.status === "fulfilled") {
+          this.sql.exec(
+            "UPDATE subagent_tasks SET status = 'running' WHERE task_id = ? AND status = 'dispatched'",
+            task.task_id,
+          );
           sent += 1;
           return;
         }
         failed += 1;
         const message =
           (result.reason as Error)?.message ?? String(result.reason);
-        settleTask(this.sql, {
-          task_id: task.task_id,
-          status: "failed",
-          error: `Dispatch failed: ${message}`,
-          now: Date.now(),
-        });
+        if (
+          task.attempt + 1 >= MAX_DISPATCH_ATTEMPTS ||
+          task.deadline_at <= Date.now()
+        )
+          settleTask(this.sql, {
+            task_id: task.task_id,
+            status: task.deadline_at <= Date.now() ? "timeout" : "failed",
+            error: `Dispatch failed: ${message}`,
+            now: Date.now(),
+          });
         logWarn("DurableClaw subagent dispatch failed", {
           "do.name": "NanoChatAgent",
           "agent.subagent.batch_id": task.batch_id,

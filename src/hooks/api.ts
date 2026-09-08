@@ -32,6 +32,23 @@ export function createChatEndpoints(token: string): AgentChatEndpoints {
       throw new Error("A socket ticket was not issued.");
     return `/api/agent/connect?conversation_id=${encodeURIComponent(conversationId)}&ticket=${encodeURIComponent(ticket)}`;
   };
+  const listConversationsPage = async (cursor?: string) => {
+    const data = await api(
+      `/api/agent/conversations${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`,
+    );
+    return {
+      conversations: data.conversations.map(
+        (row: Record<string, any>): ConversationSummary => ({
+          id: row.conversation_id,
+          title: row.title,
+          createdAt: new Date(row.created_at).toISOString(),
+          lastActiveAt: new Date(row.last_active_at).toISOString(),
+          wsPath: `/api/agent/connect?conversation_id=${encodeURIComponent(row.conversation_id)}`,
+        }),
+      ),
+      nextCursor: data.next_cursor ?? null,
+    };
+  };
   return {
     createConversation: async () => {
       const conversationId = crypto.randomUUID();
@@ -42,16 +59,9 @@ export function createChatEndpoints(token: string): AgentChatEndpoints {
       return { conversationId, wsPath: await mintWsPath(conversationId) };
     },
     mintWsPath,
-    listConversations: async (): Promise<ConversationSummary[]> => {
-      const data = await api("/api/agent/conversations");
-      return data.conversations.map((row: Record<string, any>) => ({
-        id: row.conversation_id,
-        title: row.title,
-        createdAt: new Date(row.created_at).toISOString(),
-        lastActiveAt: new Date(row.last_active_at).toISOString(),
-        wsPath: `/api/agent/connect?conversation_id=${encodeURIComponent(row.conversation_id)}`,
-      }));
-    },
+    listConversations: async () =>
+      (await listConversationsPage()).conversations,
+    listConversationsPage,
     deleteConversation: async (id) => {
       await api(`/api/agent/conversations/${encodeURIComponent(id)}`, {
         method: "DELETE",

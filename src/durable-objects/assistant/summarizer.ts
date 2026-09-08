@@ -1,3 +1,4 @@
+import { recordMemorySourceMessages } from "./memorySources";
 /**
  * DurableClaw conversation compaction: snapshot an unsummarized window into the
  * durable batch outbox, then apply the completed result on a later alarm.
@@ -219,6 +220,7 @@ export async function applyConversationSummary(args: {
       retryTaskId: args.taskId,
       onDeletionPending: args.onDeletionPending,
       onCommit: (vectorId) => {
+        recordMemorySourceMessages(args.sql, vectorId, sourceMessageIds);
         // A raw write can finish during this summary's embedding/upsert. Capture
         // its final IDs for authoritative local provenance before committing the
         // cursor, which prevents any subsequent raw write from passing its guard.
@@ -394,11 +396,27 @@ function messagesSinceCursor(
         .toArray()[0] as
         { created_at: number; cursor_rowid: number } | undefined)
     : undefined;
+  // A reply/tool row may arrive after forgetting (for example, a stopped
+  // stream's partial reply). It inherits its own user turn's exclusion, but
+  // an unrelated subsequent user turn stays eligible.
+  const sourceEligible = `
+    NOT EXISTS (SELECT 1 FROM memory_excluded_messages WHERE memory_excluded_messages.message_id = messages.message_id)
+    AND NOT EXISTS (
+      SELECT 1 FROM memory_excluded_messages WHERE memory_excluded_messages.message_id = (
+        SELECT source_user.message_id FROM messages AS source_user
+        WHERE source_user.conversation_id = messages.conversation_id
+          AND source_user.role = 'user'
+          AND (source_user.created_at, source_user.rowid) <= (messages.created_at, messages.rowid)
+        ORDER BY source_user.created_at DESC, source_user.rowid DESC LIMIT 1
+      )
+    )`;
   if (!cursor)
-    return { predicate: "conversation_id = ?", bindings: [conversationId] };
+    return {
+      predicate: `conversation_id = ? AND ${sourceEligible}`,
+      bindings: [conversationId],
+    };
   return {
-    predicate:
-      "conversation_id = ? AND (created_at > ? OR (created_at = ? AND rowid > ?))",
+    predicate: `conversation_id = ? AND (created_at > ? OR (created_at = ? AND rowid > ?)) AND ${sourceEligible}`,
     bindings: [
       conversationId,
       cursor.created_at,

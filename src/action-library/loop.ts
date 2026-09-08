@@ -88,6 +88,12 @@ export interface ToolLoopParams {
    */
   reasoningEffort?: ReasoningEffort;
   onEvent?: (event: ToolLoopEvent) => void;
+  /** Cumulative completed provider messages, before the next step can start. */
+  onStepComplete?: (messages: ModelMessage[]) => void;
+  /** Durable invocation/result hooks run even when a stream stops mid-tool. */
+  onToolStart?: (message: ModelMessage) => void;
+  onToolComplete?: (toolCallId: string, output: unknown) => void;
+  retainToolExecution?: (execution: Promise<unknown>) => void;
   abortSignal?: AbortSignal;
 }
 
@@ -294,12 +300,70 @@ export async function runToolLoop(
 
   const toolCalls: ToolLoopResult["toolCalls"] = [];
   let generationError: unknown;
+  const tools =
+    params.onToolStart || params.onToolComplete
+      ? (Object.fromEntries(
+          Object.entries(params.tools).map(([toolName, definition]) => {
+            if (!definition.execute) return [toolName, definition];
+            const execute = definition.execute;
+            return [
+              toolName,
+              {
+                ...definition,
+                execute: (
+                  input: unknown,
+                  options: Parameters<typeof execute>[1],
+                ) => {
+                  params.abortSignal?.throwIfAborted();
+                  params.onToolStart?.(
+                    replay.preserveMessages([
+                      {
+                        role: "assistant",
+                        content: [
+                          {
+                            type: "tool-call",
+                            toolCallId: options.toolCallId,
+                            toolName,
+                            input,
+                          },
+                        ],
+                      } as ModelMessage,
+                    ])[0],
+                  );
+                  const execution = (async () => {
+                    try {
+                      const output = await execute(input, options);
+                      params.onToolComplete?.(options.toolCallId, {
+                        type: "text",
+                        value:
+                          typeof output === "string"
+                            ? output
+                            : (JSON.stringify(output) ?? ""),
+                      });
+                      return output;
+                    } catch (error) {
+                      params.onToolComplete?.(options.toolCallId, {
+                        type: "error-text",
+                        value:
+                          "Tool execution failed; any external effects may be incomplete.",
+                      });
+                      throw error;
+                    }
+                  })();
+                  params.retainToolExecution?.(execution.catch(() => {}));
+                  return execution;
+                },
+              },
+            ];
+          }),
+        ) as ToolSet)
+      : params.tools;
 
   const result = streamText({
     model: openai.chat(params.model),
     system: params.system,
     messages: params.messages,
-    tools: params.tools,
+    tools,
     stopWhen: [stepCountIs(params.maxSteps), ...(params.stopWhen ?? [])],
     abortSignal: params.abortSignal,
     // AI SDK textStream omits error parts; its onError hook is the primary
@@ -317,6 +381,9 @@ export async function runToolLoop(
         }
       : {}),
     onStepFinish: (event) => {
+      params.onStepComplete?.(
+        replay.preserveMessages(event.response.messages as ModelMessage[]),
+      );
       for (const call of event.toolCalls ?? []) {
         params.onEvent?.({
           type: "tool_call",

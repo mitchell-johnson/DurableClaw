@@ -50,6 +50,10 @@ export interface AgentTurnParams {
   fallbackText?: (finishReason: string | null) => string | null;
   /** Domain hook, called AFTER the corresponding frame is emitted. */
   onEvent?: (event: ToolLoopEvent) => void;
+  onStepComplete?: (messages: ModelMessage[]) => void;
+  onToolStart?: (message: ModelMessage) => void;
+  onToolComplete?: (toolCallId: string, output: unknown) => void;
+  retainToolExecution?: (execution: Promise<unknown>) => void;
 }
 
 export interface AgentTurnResult extends ToolLoopResult {
@@ -73,6 +77,10 @@ export async function runAgentTurn(
     stopWhen: params.stopWhen,
     reasoningEffort: params.reasoningEffort,
     abortSignal: params.abortSignal,
+    onStepComplete: params.onStepComplete,
+    onToolStart: params.onToolStart,
+    onToolComplete: params.onToolComplete,
+    retainToolExecution: params.retainToolExecution,
     onEvent: (event) => {
       // Each branch maps one known event to its frame. An event type this
       // kernel does not know gets NO frame — but still reaches `onEvent`

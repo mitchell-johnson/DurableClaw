@@ -7,7 +7,7 @@ All `/api/agent/*`, `/api/events`, `/api/inbox`, `/api/socket-ticket`, and legac
 | Method / path                                                     | Purpose                                                                                     |
 | ----------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
 | `POST /api/agent/init`                                            | Ensure a conversation: `{ "conversation_id": "chosen-id", "pageContext": "optional text" }` |
-| `GET /api/agent/conversations`                                    | List owned conversations                                                                    |
+| `GET /api/agent/conversations`                                    | List owned conversations; supports `cursor` and `limit`                                     |
 | `GET /api/agent/conversations/:id`                                | Conversation metadata                                                                       |
 | `GET /api/agent/conversations/:id/messages`                       | Paginated message history                                                                   |
 | `DELETE /api/agent/conversations/:id`                             | Cancel work and delete a conversation                                                       |
@@ -22,7 +22,11 @@ All `/api/agent/*`, `/api/events`, `/api/inbox`, `/api/socket-ticket`, and legac
 | `GET /api/inbox`                                                  | Recent durable notifications and proposed follow-ups                                        |
 | `POST /api/socket-ticket`                                         | Mint a 30-second, single-use ticket for `{ "conversation_id": "id" }`                       |
 
-The public router uses an explicit endpoint allowlist. Internal research results, memory-tier checks, initialization authority, and reconciliation surfaces cannot be selected through arbitrary proxy paths.
+The public router uses an explicit endpoint allowlist. Internal research results, research tool-policy checks (`/tool-policy`), memory-tier checks, initialization authority, and reconciliation surfaces cannot be selected through arbitrary proxy paths.
+
+JSON request bodies must be objects. Invalid, missing, or malformed required bodies return `400`; bodies larger than 64 KiB return `413`, including streamed uploads without a declared length. API responses disable caching. The browser pages use a Content Security Policy and block framing.
+
+Conversation pages default to 30 records, with a maximum of 100. Pass the opaque `next_cursor` to the next request until it is null. Conversations are ordered by last activity and then ID, so equal timestamps do not skip older records. The client exposes older pages in the sidebar and reconnects to the conversation currently selected.
 
 Example event:
 
@@ -73,9 +77,9 @@ Example MCP configuration:
 }
 ```
 
-The example host is a placeholder. Set `MCP_CREDENTIALS_SECRET` before providing headers. The server encrypts headers before SQLite persistence; the returned configuration contains an opaque `headers_encrypted` field, never plaintext credentials. Saving that field unchanged retains credentials. Replacing `headers` rotates them. Removing a server drops its configuration and invalidates discovery cache.
+The example host is a placeholder. Set `MCP_CREDENTIALS_SECRET` before providing headers. The server encrypts headers before SQLite persistence; the returned configuration contains an opaque `headers_encrypted` field, never plaintext credentials. Saving that exact stored field unchanged for the same server retains credentials. Credential encryption is bound to the authenticated owner, workspace, server name, and URL. Moving a server to another URL or changing its name requires fresh plaintext `headers`; opaque ciphertext from another configuration is rejected. Replacing `headers` rotates them. Removing a server drops its configuration and invalidates both cached and in-flight discovery. Current tool policy and server configuration are checked again immediately before execution.
 
-MCP tools use stable `mcp_<server>_<tool>_<hash>` aliases capped below 64 characters. Every remote execution uses the same server-issued approval mechanism as file mutations. The approval is bound to conversation, tool, exact canonical arguments, expiry, and single consumption. A model-supplied `confirmation_id` alone is insufficient. MCP model calls use `{ "arguments": { ...remoteInput }, "confirmation_id": "optional-approval-id" }`. The complete remote input schema is preserved inside `arguments` as a separate JSON Schema resource, including its definitions, references and root constraints. An existing schema `$id` is retained; schemas without one receive a stable neutral resource id so local references keep resolving within the remote schema. A remote property named `confirmation_id` remains ordinary data inside `arguments` and is included in the approval hash. Only the contents of `arguments` are sent to the MCP server, which validates its schema. The outer approval field is never forwarded.
+MCP tools use stable `mcp_<server>_<tool>_<hash>` aliases capped below 64 characters. Every remote execution uses the same server-issued approval mechanism as file mutations. The approval is bound to conversation, tool, current server configuration/catalog, exact canonical arguments, expiry, and single consumption. A model-supplied `confirmation_id` alone is insufficient. MCP model calls use `{ "arguments": { ...remoteInput }, "confirmation_id": "optional-approval-id" }`. The complete remote input schema is preserved inside `arguments` as a separate JSON Schema resource, including its definitions, references and root constraints. An existing schema `$id` is retained; schemas without one receive a stable neutral resource id so local references keep resolving within the remote schema. A remote property named `confirmation_id` remains ordinary data inside `arguments` and is included in the approval hash. Only the contents of `arguments` are sent to the MCP server, which validates its schema. The outer approval field is never forwarded. Discovery preserves schema constraints and literal values; excessive schema depth, node count, or catalog size is rejected instead of truncating the schema. Catalog limits are listed in the runtime documentation.
 
 ## Authentication service
 
@@ -92,4 +96,6 @@ Non-2xx, invalid principal data, or mismatched identities fail closed. IDs must 
 
 Custom tools must close over server-resolved identity and conversation state. Never expose owner/workspace IDs as model parameters. Mutations should use `defineConfirmTool`; research children must receive only the read-only factory.
 
-Memory pagination advances over scanned inventory records, including records hidden by local staging or deletion rules. A response can contain an empty `memories` array and a non-null `next_cursor`; continue until the cursor is null.
+Memory pages use an opaque cursor ordered by creation time and vector ID, and continue to accept old numeric offsets during upgrades. A page reads only its selected local IDs from R2; unavailable or newly hidden records can leave an empty `memories` array with a non-null `next_cursor`. Continue until that cursor is null. Encode memory IDs as URL path components, including IDs containing a colon.
+
+Forget-all hides the local snapshot immediately and may return `202` with `{ "success": true, "pending": true }` while durable inventory discovery and deletion continue. Each deletion pass handles at most 100 IDs. Remote failures retain the scheduled cleanup and do not make forgotten records visible again.

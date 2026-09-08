@@ -54,7 +54,7 @@ export class GroupMemory {
       .exec<MemoryRow>("SELECT key, value FROM group_memory")
       .toArray();
 
-    const result: Record<string, string> = {};
+    const result: Record<string, string> = Object.create(null);
     for (const row of rows) {
       result[row.key] = row.value;
     }

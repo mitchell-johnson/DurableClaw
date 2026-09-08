@@ -31,6 +31,7 @@
 
 import type { Env } from "../../types";
 import { writeOwnedMemory } from "./ownedMemory";
+import { recordMemorySourceMessages } from "./memorySources";
 import { extractEntities } from "./entityExtraction";
 import { logError, logDebug } from "../../telemetry/logger";
 
@@ -157,6 +158,7 @@ export async function writeToolCallMemory(
     tool_args: unknown;
     tool_output: unknown;
     result_count?: number;
+    source_message_ids?: string[];
     stillValid?: () => boolean;
     onDeletionPending?: () => void;
   },
@@ -188,6 +190,11 @@ export async function writeToolCallMemory(
         },
       },
       onCommit: (vectorId) => {
+        recordMemorySourceMessages(
+          sql,
+          vectorId,
+          args.source_message_ids ?? [],
+        );
         // Extract entities + write memory_links rows. The DO's SQL is
         // not transactional in the JS sense, but consecutive statements
         // on the same SqlStorage are serially applied; that's good enough

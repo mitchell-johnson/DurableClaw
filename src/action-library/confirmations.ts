@@ -36,11 +36,16 @@ export function canonicalJsonString(value: unknown): string {
  */
 export async function computeArgsHash(
   input: Record<string, unknown>,
+  confirmationScope?: string,
 ): Promise<string> {
   const { confirmation_id: _omitted, ...rest } = input;
   const digest = await crypto.subtle.digest(
     "SHA-256",
-    new TextEncoder().encode(canonicalJsonString(rest)),
+    new TextEncoder().encode(
+      canonicalJsonString(
+        confirmationScope === undefined ? rest : [confirmationScope, rest],
+      ),
+    ),
   );
   return Array.from(new Uint8Array(digest))
     .map((b) => b.toString(16).padStart(2, "0"))

@@ -308,6 +308,57 @@ const namespacePrefix = (namespace: string) =>
 const namespaceKey = (namespace: string, id: string) =>
   `${namespacePrefix(namespace)}${encodeURIComponent(id)}.json`;
 
+/** A bounded inventory walk uses the authoritative namespace keys, not vector
+ * query limits or one R2 body read per stored memory. */
+export async function listMemoryInventoryIdsPage(
+  env: Pick<MemoryEnv, "WORKSPACE">,
+  args: {
+    user_id: string;
+    tenant_binding: string;
+    cursor?: string;
+    limit?: number;
+  },
+): Promise<{ ids: string[]; cursor: string | null }> {
+  const namespace = buildNamespace(args.user_id, args.tenant_binding);
+  const prefix = namespacePrefix(namespace);
+  const page = await requireInventory(env).list({
+    prefix,
+    limit: bounded(args.limit, 1000, 1, 1000),
+    ...(args.cursor ? { cursor: args.cursor } : {}),
+  });
+  if (page.truncated && !page.cursor)
+    throw new Error("Incomplete memory inventory page");
+  const ids = page.objects.flatMap((row) => {
+    if (!row.key.startsWith(prefix) || !row.key.endsWith(".json")) return [];
+    try {
+      const id = decodeURIComponent(row.key.slice(prefix.length, -5));
+      return id && id.length <= 256 && namespaceKey(namespace, id) === row.key
+        ? [id]
+        : [];
+    } catch {
+      return [];
+    }
+  });
+  return { ids, cursor: page.truncated ? page.cursor : null };
+}
+
+/** Fetch exactly an owner's selected management page; SQL visibility is checked
+ * again by the owner after these asynchronous reads. */
+export async function getInventoryMemoriesByIds(
+  env: Pick<MemoryEnv, "WORKSPACE">,
+  args: { user_id: string; tenant_binding: string; ids: string[] },
+): Promise<AgentMemoryMatch[]> {
+  if (args.ids.length > MAX_LIST_LIMIT)
+    throw new Error("Memory inventory page exceeds limit");
+  const namespace = buildNamespace(args.user_id, args.tenant_binding);
+  return activeInventoryMatches(
+    env,
+    args.ids.map((id) =>
+      toMatch({ id, metadata: { user_namespace: namespace } }),
+    ),
+  );
+}
+
 export async function deleteMemoriesByIds(
   env: Pick<MemoryEnv, "MEMORY_INDEX" | "WORKSPACE">,
   ids: string[],

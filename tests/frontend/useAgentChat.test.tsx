@@ -859,4 +859,212 @@ describe("useAgentChat", () => {
     expect(eps.createConversation).toHaveBeenCalled();
     expect(wsConstructions[0].url).toContain("/ws/new?token=n");
   });
+  it("keeps a selected conversation when sending after disconnect", async () => {
+    const recent = {
+      id: "recent",
+      title: "Recent",
+      createdAt: new Date().toISOString(),
+      lastActiveAt: new Date().toISOString(),
+      wsPath: "/ws/recent",
+    };
+    const selected = { ...recent, id: "selected", wsPath: "/ws/selected" };
+    const eps = endpoints({
+      listConversations: vi.fn(async () => [recent, selected]),
+    });
+    const { result } = renderHook(() => useAgentChat({ endpoints: eps }));
+    await act(async () => {
+      await result.current.switchConversation(selected);
+    });
+    act(() => {
+      wsConstructions[0].close();
+      wsConstructions[0].onclose?.();
+    });
+    await act(async () => {
+      await result.current.sendMessage("Continue here");
+    });
+    expect(wsConstructions.at(-1)?.url).toContain("/ws/selected?");
+    expect(result.current.conversationId).toBe("selected");
+  });
+
+  it("does not let a superseded conversation creation replace the winning identity", async () => {
+    let finish!: (value: { conversationId: string; wsPath: string }) => void;
+    const eps = endpoints({
+      createConversation: vi
+        .fn()
+        .mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              finish = resolve;
+            }),
+        )
+        .mockResolvedValueOnce({
+          conversationId: "winner",
+          wsPath: "/ws/winner",
+        }),
+    });
+    const { result } = renderHook(() => useAgentChat({ endpoints: eps }));
+    let losing!: Promise<void>;
+    act(() => {
+      losing = result.current.newConversation() as unknown as Promise<void>;
+    });
+    await act(async () => {
+      await result.current.newConversation();
+    });
+    await act(async () => {
+      finish({ conversationId: "loser", wsPath: "/ws/loser" });
+      await losing;
+    });
+    await act(async () => {
+      await result.current.sendMessage("Winner");
+    });
+    expect(result.current.conversationId).toBe("winner");
+    expect(wsConstructions).toHaveLength(1);
+  });
+
+  it("rejects an approval continuation whose conversation has changed", async () => {
+    const eps = endpoints();
+    const { result } = renderHook(() => useAgentChat({ endpoints: eps }));
+    await act(async () => {
+      await result.current.connect();
+    });
+    await act(async () => {
+      await expect(
+        result.current.sendMessage("Approved", {
+          expectedConversationId: "old",
+        }),
+      ).rejects.toThrow("conversation");
+    });
+    expect(wsConstructions[0].send).not.toHaveBeenCalled();
+    expect(result.current.messages).toEqual([]);
+  });
+
+  it("reports failed sends to callers so the composer can retain the draft", async () => {
+    const eps = endpoints({
+      createConversation: vi.fn(async () => {
+        throw new Error("Unavailable");
+      }),
+    });
+    const { result } = renderHook(() => useAgentChat({ endpoints: eps }));
+    await act(async () => {
+      await expect(
+        result.current.sendMessage("Keep this draft"),
+      ).rejects.toThrow("Unavailable");
+    });
+    expect(result.current.isLoading).toBe(false);
+    expect(result.current.messages).toEqual([]);
+  });
+
+  it("does not create another conversation when the listing request fails", async () => {
+    const eps = endpoints({
+      listConversations: vi.fn(async () => {
+        throw new Error("Offline");
+      }),
+    });
+    const { result } = renderHook(() => useAgentChat({ endpoints: eps }));
+    await act(async () => {
+      await expect(result.current.sendMessage("Continue")).rejects.toThrow(
+        "Offline",
+      );
+    });
+    expect(eps.createConversation).not.toHaveBeenCalled();
+  });
+
+  it("loads older conversation pages and ignores a page superseded by refresh", async () => {
+    const row = (id: string) => ({
+      id,
+      title: id,
+      wsPath: `/ws/${id}`,
+      createdAt: new Date().toISOString(),
+      lastActiveAt: new Date().toISOString(),
+    });
+    let finish!: (value: any) => void;
+    let reads = 0;
+    const eps = endpoints({
+      listConversationsPage: vi.fn(async (cursor?: string) => {
+        if (cursor)
+          return new Promise((resolve) => {
+            finish = resolve;
+          });
+        return {
+          conversations: [row(++reads === 1 ? "first" : "fresh")],
+          nextCursor: "page-2",
+        };
+      }),
+    });
+    const { result } = renderHook(() => useAgentChat({ endpoints: eps }));
+    await act(async () => {
+      await result.current.refreshConversations();
+    });
+    expect(result.current.hasMoreConversations).toBe(true);
+    let page!: Promise<void>;
+    act(() => {
+      page = result.current.loadMoreConversations();
+    });
+    await act(async () => {
+      await result.current.refreshConversations();
+    });
+    await act(async () => {
+      finish({ conversations: [row("old")], nextCursor: null });
+      await page;
+    });
+    expect(result.current.conversations.map((row) => row.id)).toEqual([
+      "fresh",
+    ]);
+    act(() => {
+      page = result.current.loadMoreConversations();
+    });
+    await act(async () => {
+      finish({ conversations: [row("fresh"), row("older")], nextCursor: null });
+      await page;
+    });
+    expect(result.current.conversations.map((row) => row.id)).toEqual([
+      "fresh",
+      "older",
+    ]);
+    expect(result.current.hasMoreConversations).toBe(false);
+  });
+
+  it("bounds a connection whose server never finishes replay and ignores its late frames", async () => {
+    vi.useFakeTimers();
+    MockWebSocket.autoReady = false;
+    const { result } = renderHook(() =>
+      useAgentChat({ endpoints: endpoints() }),
+    );
+    try {
+      let connected!: Promise<void>;
+      act(() => {
+        connected = result.current.connect();
+      });
+      await act(async () => {
+        await flushMicrotasks();
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_001);
+      });
+      expect(result.current.isReconnecting).toBe(false);
+      expect(result.current.isConnected).toBe(false);
+      expect(result.current.error).toMatch(/timed out/i);
+      await connected;
+      act(() => {
+        wsConstructions[0].emit({
+          type: "assistant_message",
+          content: "Late discarded response",
+        });
+      });
+      expect(result.current.messages).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  it("makes a newly created conversation immediately reachable in the sidebar", async () => {
+    const { result } = renderHook(() =>
+      useAgentChat({ endpoints: endpoints() }),
+    );
+    await act(async () => {
+      await result.current.newConversation();
+    });
+    expect(result.current.conversations.map((row) => row.id)).toEqual([
+      "c-new",
+    ]);
+  });
 });

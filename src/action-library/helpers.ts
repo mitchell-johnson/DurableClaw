@@ -83,6 +83,8 @@ export interface ConfirmToolOptions {
   confirmations?: ToolConfirmationCoordinator;
   /** Conversation the ToolSet was built for; scopes every record. */
   conversationId?: string;
+  /** Trusted execution target/version, never model input (e.g. an MCP config). */
+  confirmationScope?: string;
 }
 
 /**
@@ -108,12 +110,7 @@ export function defineConfirmTool<T extends Record<string, unknown>>(
     buildPreview: (input: T) => string | Promise<string>;
     execute: (input: T) => Promise<string>;
   },
-  options?: {
-    /** Store bound to the owning DO + conversation. Absent = fail closed. */
-    confirmations?: ToolConfirmationCoordinator;
-    /** Conversation the ToolSet was built for; scopes every record. */
-    conversationId?: string;
-  },
+  options?: ConfirmToolOptions,
 ) {
   const props = {
     ...config.properties,
@@ -131,7 +128,10 @@ export function defineConfirmTool<T extends Record<string, unknown>>(
     required,
     execute: async (rawInput) => {
       const input = rawInput as T & { confirmation_id?: unknown };
-      const argsHash = await computeArgsHash(input as Record<string, unknown>);
+      const argsHash = await computeArgsHash(
+        input as Record<string, unknown>,
+        options?.confirmationScope,
+      );
       const coordinator = options?.confirmations;
       const conversationId = options?.conversationId;
 

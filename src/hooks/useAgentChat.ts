@@ -63,6 +63,9 @@ export interface UseAssistantChatReturn {
   // Conversation
   conversationId: string | null;
   conversations: ConversationSummary[];
+  hasMoreConversations: boolean;
+  isLoadingConversations: boolean;
+  loadMoreConversations: () => Promise<void>;
   messages: AssistantMessage[];
   activeToolCalls: ToolCallInfo[];
   toolResults: ToolResultRecord[];
@@ -71,10 +74,13 @@ export interface UseAssistantChatReturn {
 
   // Actions
   connect: () => Promise<void>;
-  sendMessage: (content: string) => Promise<void>;
+  sendMessage: (
+    content: string,
+    options?: { expectedConversationId: string },
+  ) => Promise<void>;
   cancel: () => void;
   cancelResearch: () => void;
-  newConversation: () => void;
+  newConversation: () => Promise<void>;
   switchConversation: (conversation: ConversationSummary) => Promise<void>;
   refreshConversations: () => Promise<void>;
   resumeStaleConversation: () => Promise<void>;
@@ -111,6 +117,10 @@ export interface AgentChatEndpoints {
   mintWsPath: (conversationId: string, wsPathHint?: string) => Promise<string>;
   /** Optional: list conversations (enables reconnect-to-recent + history UI). */
   listConversations?: () => Promise<ConversationSummary[]>;
+  listConversationsPage?: (cursor?: string) => Promise<{
+    conversations: ConversationSummary[];
+    nextCursor: string | null;
+  }>;
   /** Optional: delete a conversation. */
   deleteConversation?: (id: string) => Promise<Response>;
 }
@@ -154,6 +164,13 @@ export function useAgentChat(
   const [activeToolCalls, setActiveToolCalls] = useState<ToolCallInfo[]>([]);
   const [toolResults, setToolResults] = useState<ToolResultRecord[]>([]);
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
+  const [hasMoreConversations, setHasMoreConversations] = useState(false);
+  const [isLoadingConversations, setIsLoadingConversations] = useState(false);
+  const listStateRef = useRef({
+    generation: 0,
+    cursor: null as string | null,
+    loading: false,
+  });
   const [error, setError] = useState<string | null>(null);
   const [staleConversation, setStaleConversation] =
     useState<ConversationSummary | null>(null);
@@ -311,6 +328,7 @@ export function useAgentChat(
       // Invalidate any in-flight connect so a socket that opens after unmount
       // tears itself down instead of being assigned to a dead component's ref.
       connectEpochRef.current++;
+      listStateRef.current.generation++;
       if (wsRef.current) {
         wsRef.current.close(1000, "Component unmounted");
         wsRef.current = null;
@@ -358,6 +376,7 @@ export function useAgentChat(
       if (epoch !== undefined && epoch !== connectEpochRef.current) {
         return Promise.resolve();
       }
+      let readyTimer: ReturnType<typeof setTimeout> | undefined;
       const promise = new Promise<void>((resolve, reject) => {
         // The generation this socket belongs to. A later connect bumps
         // connectEpochRef, so an in-flight connect that opens after a newer one
@@ -377,11 +396,25 @@ export function useAgentChat(
         }
 
         const socket = new WebSocket(wsUrl);
+        let retired = false;
+        readyTimer = setTimeout(() => {
+          retired = true;
+          socket.close(1000, "Connection timed out");
+          if (myEpoch !== connectEpochRef.current) {
+            resolve();
+            return;
+          }
+          if (wsRef.current === socket) wsRef.current = null;
+          setIsConnected(false);
+          setIsReconnecting(false);
+          resetTurnState();
+          reject(new Error("The connection timed out. Please try again."));
+        }, 30_000);
 
         socket.onopen = () => {
           // A newer connect started while this socket was opening — abandon it so
           // its history/deltas don't bleed into the conversation that won.
-          if (myEpoch !== connectEpochRef.current) {
+          if (retired || myEpoch !== connectEpochRef.current) {
             socket.close(1000, "Superseded by new connection");
             resolve();
             return;
@@ -414,6 +447,7 @@ export function useAgentChat(
         };
 
         socket.onmessage = (event) => {
+          if (retired) return;
           // Drop frames from a socket that a newer connect has superseded so a
           // losing connection can't interleave its conversation's history/deltas
           // into the chat the user is actually looking at. Settle the connect
@@ -651,6 +685,8 @@ export function useAgentChat(
         };
 
         socket.onerror = (err) => {
+          retired = true;
+          socket.close(1000, "Connection failed");
           console.error("Agent connection operation failed");
           // A superseded socket erroring out must not clobber the winning
           // connection's state or reject its already-settled promise.
@@ -671,6 +707,7 @@ export function useAgentChat(
         };
 
         socket.onclose = () => {
+          retired = true;
           // Only the current-generation socket owns the shared connection flag;
           // a deliberately-superseded socket closing must not flip it.
           if (myEpoch !== connectEpochRef.current) {
@@ -698,6 +735,7 @@ export function useAgentChat(
       // an unobserved failure can't surface as an unhandled rejection.
       connectPromiseRef.current = promise;
       const clearInFlight = () => {
+        clearTimeout(readyTimer);
         if (connectPromiseRef.current === promise) {
           connectPromiseRef.current = null;
         }
@@ -708,24 +746,54 @@ export function useAgentChat(
     [resetTurnState, ensureTurnMessage, markTurnStopped, setMessages],
   );
 
-  const fetchConversations = useCallback(async (): Promise<
-    ConversationSummary[]
-  > => {
-    // A flow with no listing endpoint (the embedding application) has exactly
-    // one conversation, named in its URL — there is nothing to list.
-    if (!endpoints.listConversations) return [];
-    try {
-      const list = await endpoints.listConversations();
-      setConversations(list);
-      return list;
-    } catch {
-      return [];
-    }
-  }, [endpoints]);
+  const fetchConversations = useCallback(
+    async (next = false): Promise<ConversationSummary[]> => {
+      if (!endpoints.listConversations && !endpoints.listConversationsPage)
+        return [];
+      const state = listStateRef.current;
+      if (next && (!state.cursor || state.loading)) return [];
+      const generation = ++state.generation;
+      state.loading = true;
+      setIsLoadingConversations(true);
+      try {
+        const page = endpoints.listConversationsPage
+          ? await endpoints.listConversationsPage(
+              next ? state.cursor! : undefined,
+            )
+          : {
+              conversations: await endpoints.listConversations!(),
+              nextCursor: null,
+            };
+        if (generation !== state.generation) return page.conversations;
+        state.cursor = page.nextCursor;
+        setHasMoreConversations(Boolean(page.nextCursor));
+        setConversations((previous) =>
+          Array.from(
+            new Map(
+              (next
+                ? [...previous, ...page.conversations]
+                : page.conversations
+              ).map((row) => [row.id, row]),
+            ).values(),
+          ),
+        );
+        return page.conversations;
+      } finally {
+        if (generation === state.generation) {
+          state.loading = false;
+          setIsLoadingConversations(false);
+        }
+      }
+    },
+    [endpoints],
+  );
+  const loadMoreConversations = useCallback(async () => {
+    await fetchConversations(true);
+  }, [fetchConversations]);
 
   const reconnectToConversation = useCallback(
     async (conversation: ConversationSummary, epoch?: number) => {
-      conversationIdRef.current = conversation.id;
+      if (epoch !== undefined && epoch !== connectEpochRef.current) return;
       // The conversation_id from the server response is authoritative — extract
       // from wsPath as a fallback for older route shapes during deploys.
       const conversationId =
@@ -733,6 +801,7 @@ export function useAgentChat(
       if (!conversationId) {
         throw new Error("Conversation missing id");
       }
+      conversationIdRef.current = conversationId;
       const wsPath = await endpoints.mintWsPath(
         conversationId,
         conversation.wsPath,
@@ -749,11 +818,30 @@ export function useAgentChat(
     [endpoints, connectWebSocket],
   );
 
-  const createConversation = useCallback(async (): Promise<string> => {
-    const { conversationId, wsPath } = await endpoints.createConversation();
-    conversationIdRef.current = conversationId;
-    return wsPath;
-  }, [endpoints]);
+  const createConversation = useCallback(
+    async (epoch: number): Promise<string> => {
+      const { conversationId, wsPath } = await endpoints.createConversation();
+      if (epoch === connectEpochRef.current) {
+        conversationIdRef.current = conversationId;
+        const timestamp = new Date().toISOString();
+        listStateRef.current.generation++;
+        listStateRef.current.loading = false;
+        setIsLoadingConversations(false);
+        setConversations((previous) => [
+          {
+            id: conversationId,
+            title: null,
+            createdAt: timestamp,
+            lastActiveAt: timestamp,
+            wsPath,
+          },
+          ...previous.filter((row) => row.id !== conversationId),
+        ]);
+      }
+      return wsPath;
+    },
+    [endpoints],
+  );
 
   const connect = useCallback(async () => {
     // Already connected — nothing to do. This check MUST come before the
@@ -809,7 +897,10 @@ export function useAgentChat(
     // endpoint, for which there is no "most recent conversation" to restore in
     // the first place. If a previous page's WS is still open (the user
     // navigated between reports), close it before creating the new one.
-    if (options?.alwaysCreateNew || !endpoints.listConversations) {
+    if (
+      options?.alwaysCreateNew ||
+      (!endpoints.listConversations && !endpoints.listConversationsPage)
+    ) {
       resetTurnState();
       if (wsRef.current) {
         wsRef.current.close(1000, "New page context");
@@ -824,7 +915,7 @@ export function useAgentChat(
       forceNewConversationRef.current = false;
       setIsReconnecting(true);
       try {
-        const wsPath = await createConversation();
+        const wsPath = await createConversation(epoch);
         // A newer connect superseded us while createConversation was in flight;
         // bail rather than open a socket the user no longer wants.
         if (epoch !== connectEpochRef.current) return;
@@ -881,9 +972,21 @@ export function useAgentChat(
   ]);
 
   const sendMessage = useCallback(
-    async (content: string) => {
+    async (
+      content: string,
+      sendOptions?: { expectedConversationId: string },
+    ) => {
       if (!content.trim()) return;
-
+      const checkConversation = () => {
+        if (
+          sendOptions &&
+          sendOptions.expectedConversationId !== conversationIdRef.current
+        )
+          throw new Error(
+            "The conversation changed. Return to the original conversation to continue the approved action.",
+          );
+      };
+      checkConversation();
       const sendEpoch = ++sendEpochRef.current;
       setIsLoading(true);
       setError(null);
@@ -912,16 +1015,19 @@ export function useAgentChat(
           // Lazily opening a socket here is itself a connect — claim a generation
           // so an in-flight connect() can't open a competing socket underneath us.
           epoch = ++connectEpochRef.current;
-          if (options.conversationId) {
-            // Known conversation: reconnect to THAT one. Listing (or creating)
+          const selectedId =
+            options.conversationId ||
+            (!forceNewConversationRef.current && conversationIdRef.current);
+          if (selectedId) {
+            // Reconnect to the selected conversation, including after an idle disconnect. Listing (or creating)
             // here would silently move the user to a different board's chat.
-            const wsPath = await endpoints.mintWsPath(options.conversationId);
+            const wsPath = await endpoints.mintWsPath(selectedId);
             await connectWebSocket(wsPath, epoch, { clearHistoryOnOpen: true });
           } else if (forceNewConversationRef.current) {
             // TTL-stale intent: commit to a fresh conversation rather than
             // resurrect the previous one. The banner clears once the new
             // conversation is created server-side.
-            const wsPath = await createConversation();
+            const wsPath = await createConversation(epoch);
             await connectWebSocket(wsPath, epoch);
             forceNewConversationRef.current = false;
             setStaleConversation(null);
@@ -931,7 +1037,7 @@ export function useAgentChat(
             if (existing) {
               await reconnectToConversation(existing, epoch);
             } else {
-              const wsPath = await createConversation();
+              const wsPath = await createConversation(epoch);
               await connectWebSocket(wsPath, epoch);
             }
           }
@@ -946,6 +1052,7 @@ export function useAgentChat(
         )
           return;
 
+        checkConversation();
         // Send message. The outgoing message is appended AFTER any reconnect
         // above — connectWebSocket resolves once the server's history replay
         // has finished ('ready'), so the new message always lands at the end of
@@ -960,7 +1067,6 @@ export function useAgentChat(
           streamingTextRef.current = "";
           ignoreLegacyFramesRef.current = false;
           setIsLoading(true);
-          setMessages((prev) => [...prev, { role: "user", content }]);
           const pageContext = getMessageContextRef.current?.();
           wsRef.current.send(
             JSON.stringify({
@@ -970,6 +1076,7 @@ export function useAgentChat(
               ...(pageContext ? { pageContext } : {}),
             }),
           );
+          setMessages((prev) => [...prev, { role: "user", content }]);
         } else {
           throw new Error(
             `Couldn't reach ${agentLabelRef.current} to send that. Please try again.`,
@@ -980,6 +1087,7 @@ export function useAgentChat(
         console.error("Agent connection operation failed");
         setError(err instanceof Error ? err.message : "Failed to send message");
         setIsLoading(false);
+        throw err;
       }
     },
     [
@@ -1018,7 +1126,7 @@ export function useAgentChat(
       // Create a fresh conversation server-side and connect to it. Without
       // this, sendMessage's auto-reconnect logic would pick up the most-recent
       // existing conversation and put the user right back in the old one.
-      const wsPath = await createConversation();
+      const wsPath = await createConversation(epoch);
       await connectWebSocket(wsPath, epoch);
     } catch (err) {
       if (epoch !== connectEpochRef.current) return;
@@ -1070,6 +1178,9 @@ export function useAgentChat(
   const reset = useCallback(() => {
     // Invalidate any in-flight connect so it can't reopen a socket after reset.
     connectEpochRef.current++;
+    listStateRef.current.generation++;
+    listStateRef.current.loading = false;
+    setIsLoadingConversations(false);
     if (wsRef.current) {
       wsRef.current.close(1000, "Reset");
       wsRef.current = null;
@@ -1116,6 +1227,9 @@ export function useAgentChat(
         if (!response.ok) {
           throw new Error(`Failed to delete conversation: ${response.status}`);
         }
+        listStateRef.current.generation++;
+        listStateRef.current.loading = false;
+        setIsLoadingConversations(false);
         setConversations((prev) => prev.filter((c) => c.id !== id));
         // If the deleted conversation is the currently-active one, drop back to
         // a blank panel state so the user isn't stuck looking at a zombie chat.
@@ -1140,6 +1254,9 @@ export function useAgentChat(
     isResearching,
     conversationId: conversationIdRef.current,
     conversations,
+    hasMoreConversations,
+    isLoadingConversations,
+    loadMoreConversations,
     messages,
     activeToolCalls,
     toolResults,

@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -42,6 +43,7 @@ vi.mock("../../src/hooks/useAgentChat", () => ({ useAgentChat: () => chat }));
 import { App } from "../../src/app";
 beforeEach(() => {
   vi.clearAllMocks();
+  chat.conversationId = "conversation";
   Object.defineProperty(Element.prototype, "scrollIntoView", {
     value: vi.fn(),
     configurable: true,
@@ -106,5 +108,87 @@ describe("workspace interface", () => {
     fireEvent.click(screen.getByText("Stop research"));
     expect(chat.cancelResearch).toHaveBeenCalledOnce();
     expect(chat.cancel).not.toHaveBeenCalled();
+  });
+  it("binds approval continuation to the reviewed conversation", async () => {
+    let finish!: (response: Response) => void;
+    vi.stubGlobal("fetch", (path: string) =>
+      path.includes("/confirmations/")
+        ? new Promise((resolve) => {
+            finish = resolve;
+          })
+        : Promise.resolve(Response.json({ success: true })),
+    );
+    await login();
+    fireEvent.click(screen.getByText("Approve"));
+    chat.conversationId = "different-conversation";
+    await act(async () => {
+      finish(Response.json({ success: true }));
+    });
+    expect(chat.sendMessage).toHaveBeenCalledWith(
+      expect.stringContaining("review-id"),
+      { expectedConversationId: "conversation" },
+    );
+  });
+
+  it("does not reuse an approval decision in a different conversation", async () => {
+    vi.stubGlobal("fetch", async () => Response.json({ success: true }));
+    await login();
+    fireEvent.click(screen.getByText("Decline"));
+    await screen.findByText("Declined");
+    chat.conversationId = "different-conversation";
+    fireEvent.click(screen.getByText("New conversation"));
+    // Force a normal workspace render, as the real hook does when switching.
+    fireEvent.change(screen.getByLabelText("Message"), {
+      target: { value: "New draft" },
+    });
+    expect(screen.queryByText("Declined")).toBeNull();
+    expect(screen.getByText("Approve")).toBeTruthy();
+  });
+
+  it("discards a stale memory page after a successful deletion", async () => {
+    const memory = {
+      vector_id: "memory-1",
+      type: "raw",
+      tier: "warm",
+      content_preview: "Private remembered content",
+    };
+    let finish!: (response: Response) => void;
+    let reads = 0;
+    vi.stubGlobal("fetch", async (path: string, init: RequestInit) => {
+      if (path === "/api/agent/memories" && !init.method) {
+        if (++reads === 1)
+          return Response.json({ memories: [memory], next_cursor: null });
+        return new Promise((resolve) => {
+          finish = resolve;
+        });
+      }
+      return Response.json({ success: true });
+    });
+    await login();
+    fireEvent.click(screen.getByText("Memory"));
+    await screen.findByText(memory.content_preview);
+    fireEvent.click(screen.getByText("Refresh"));
+    fireEvent.click(screen.getByText("Forget", { exact: true }));
+    await waitFor(() =>
+      expect(screen.queryByText(memory.content_preview)).toBeNull(),
+    );
+    await act(async () => {
+      finish(Response.json({ memories: [memory], next_cursor: null }));
+    });
+    expect(screen.queryByText(memory.content_preview)).toBeNull();
+  });
+  it("retains the composer draft when a send fails", async () => {
+    vi.stubGlobal("fetch", async () => Response.json({ success: true }));
+    chat.sendMessage.mockRejectedValueOnce(new Error("Connection unavailable"));
+    await login();
+    fireEvent.change(screen.getByLabelText("Message"), {
+      target: { value: "Keep this message" },
+    });
+    fireEvent.click(screen.getByText("Send", { exact: true }));
+    await screen.findByText("Connection unavailable");
+    expect(screen.getByLabelText("Message")).toHaveProperty(
+      "value",
+      "Keep this message",
+    );
   });
 });

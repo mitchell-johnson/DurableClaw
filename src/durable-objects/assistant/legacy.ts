@@ -57,6 +57,28 @@ export function importLegacyPage(
   const history = new ConversationHistoryStore(sql);
   const conversation = "legacy-" + session;
   history.ensureConversationRow(conversation);
+  const importId = (
+    kind: string,
+    key: string,
+    oldId: string,
+    role: string,
+    content: string,
+  ) => {
+    const existing = sql
+      .exec(
+        "SELECT conversation_id,role,content FROM messages WHERE message_id=?",
+        oldId,
+      )
+      .toArray()[0];
+    // Reuse earlier imports only when the entire record identity matches.
+    if (
+      existing?.conversation_id === conversation &&
+      existing.role === role &&
+      existing.content === content
+    )
+      return oldId;
+    return `sdk-import:${kind}:${session.length}:${session}:${key}`;
+  };
   for (const m of page.messages) {
     if (m.role !== "user" && m.role !== "assistant") continue;
     let content = m.content;
@@ -64,12 +86,18 @@ export function importLegacyPage(
       const parsed = JSON.parse(content);
       if (Array.isArray(parsed))
         content = parsed
-          .filter((p) => p.type === "text")
+          .filter((p) => p && p.type === "text" && typeof p.text === "string")
           .map((p) => p.text || "")
           .join("\n");
     } catch {}
     const id = history.appendMessage({
-      messageId: `legacy-${session}-${m.sequence}`,
+      messageId: importId(
+        "message",
+        String(m.sequence),
+        `legacy-${session}-${m.sequence}`,
+        m.role,
+        content,
+      ),
       conversationId: conversation,
       role: m.role,
       content,
@@ -82,14 +110,26 @@ export function importLegacyPage(
   }
   for (const m of page.memories)
     history.appendMessage({
-      messageId: `legacy-memory-${session}-${m.key}`,
+      messageId: importId(
+        "memory",
+        m.key,
+        `legacy-memory-${session}-${m.key}`,
+        "assistant",
+        `Imported saved memory ${m.key}: ${m.value}`,
+      ),
       conversationId: conversation,
       role: "assistant",
       content: `Imported saved memory ${m.key}: ${m.value}`,
     });
   for (const m of page.summaries)
     history.appendMessage({
-      messageId: `legacy-summary-${session}-${m.id}`,
+      messageId: importId(
+        "summary",
+        m.id,
+        `legacy-summary-${session}-${m.id}`,
+        "assistant",
+        `Imported conversation summary: ${m.summary}`,
+      ),
       conversationId: conversation,
       role: "assistant",
       content: `Imported conversation summary: ${m.summary}`,

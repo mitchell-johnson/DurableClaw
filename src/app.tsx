@@ -110,9 +110,11 @@ function Workspace({ token, signOut }: { token: string; signOut: () => void }) {
     id: string,
     approved: boolean,
   ) {
-    if (!chat.conversationId) return;
+    const conversationId = chat.conversationId;
+    if (!conversationId)
+      throw new Error("Open the original conversation to review this action.");
     await api(
-      `/api/agent/conversations/${encodeURIComponent(chat.conversationId)}/confirmations/${encodeURIComponent(id)}`,
+      `/api/agent/conversations/${encodeURIComponent(conversationId)}/confirmations/${encodeURIComponent(id)}`,
       {
         method: "POST",
         body: JSON.stringify({ decision: approved ? "confirmed" : "declined" }),
@@ -121,6 +123,7 @@ function Workspace({ token, signOut }: { token: string; signOut: () => void }) {
     if (approved)
       await chat.sendMessage(
         `I approved confirmation ${id}. Continue with the approved ${result.toolName} action using the same arguments and that confirmation ID.`,
+        { expectedConversationId: conversationId },
       );
   }
   return (
@@ -178,6 +181,18 @@ function Workspace({ token, signOut }: { token: string; signOut: () => void }) {
               </button>
             </div>
           ))}
+          {chat.hasMoreConversations && (
+            <button
+              disabled={chat.isLoadingConversations}
+              onClick={() =>
+                void chat
+                  .loadMoreConversations()
+                  .catch((error) => setActionError(errorText(error)))
+              }
+            >
+              Load older conversations
+            </button>
+          )}
         </div>
         <button
           onClick={() => {
@@ -235,7 +250,10 @@ function Workspace({ token, signOut }: { token: string; signOut: () => void }) {
                 </div>
               )}
               {chat.messages.map((message, index) => (
-                <article className={`message ${message.role}`} key={index}>
+                <article
+                  className={`message ${message.role}`}
+                  key={`${chat.conversationId}:${index}`}
+                >
                   <span className="message-role">
                     {message.role === "user" ? "You" : "DurableClaw"}
                   </span>
@@ -253,7 +271,7 @@ function Workspace({ token, signOut }: { token: string; signOut: () => void }) {
                     .filter((result) => result.turn === index)
                     .map((result, i) => (
                       <ToolResult
-                        key={`${result.toolName}:${i}`}
+                        key={`${result.toolName}:${i}:${result.rawJson}`}
                         result={result}
                         busy={busy}
                         decide={decision}
@@ -625,27 +643,77 @@ function Memories({ api }: { api: Api }) {
   const [error, setError] = useState("");
   const [forget, setForget] = useState(false);
   const [confirmation, setConfirmation] = useState("");
+  const generation = useRef(0);
+  const mutations = useRef(new Set<string>());
+  const [loading, setLoading] = useState(false);
+  const [pendingDeletes, setPendingDeletes] = useState(new Set<string>());
+  function invalidate() {
+    generation.current++;
+    setLoading(false);
+  }
   async function load(next?: string) {
+    if (mutations.current.size) return;
+    const epoch = ++generation.current;
+    setLoading(true);
+    setError("");
     try {
       const data = await api(
         `/api/agent/memories${next ? `?cursor=${encodeURIComponent(next)}` : ""}`,
       );
-      setMemories((previous) =>
-        next ? [...previous, ...data.memories] : data.memories,
+      if (epoch !== generation.current) return;
+      setMemories(
+        (previous) =>
+          Array.from(
+            new Map(
+              (next ? [...previous, ...data.memories] : data.memories).map(
+                (memory: Record<string, any>) => [memory.vector_id, memory],
+              ),
+            ).values(),
+          ) as Record<string, any>[],
       );
-      setCursor(data.next_cursor);
+      setCursor(data.next_cursor ?? null);
+    } catch (error) {
+      if (epoch === generation.current) setError(errorText(error));
+    } finally {
+      if (epoch === generation.current) setLoading(false);
+    }
+  }
+  async function remove(id: string, operation: () => Promise<void>) {
+    if (mutations.current.has(id)) return;
+    mutations.current.add(id);
+    setPendingDeletes(new Set(mutations.current));
+    invalidate();
+    setError("");
+    try {
+      await operation();
     } catch (error) {
       setError(errorText(error));
+    } finally {
+      invalidate();
+      mutations.current.delete(id);
+      setPendingDeletes(new Set(mutations.current));
     }
   }
   useEffect(() => {
     void load();
+    return () => {
+      generation.current++;
+    };
   }, [api]);
   return (
     <section className="settings-page">
       <div className="button-row">
-        <button onClick={() => void load()}>Refresh</button>
-        <button className="danger" onClick={() => setForget(true)}>
+        <button
+          disabled={loading || pendingDeletes.size > 0}
+          onClick={() => void load()}
+        >
+          Refresh
+        </button>
+        <button
+          className="danger"
+          disabled={pendingDeletes.size > 0}
+          onClick={() => setForget(true)}
+        >
           Forget all memories
         </button>
       </div>
@@ -664,8 +732,12 @@ function Memories({ api }: { api: Api }) {
               {memory.type} · {memory.tier}
             </span>
             <button
-              onClick={async () => {
-                try {
+              disabled={
+                pendingDeletes.has(memory.vector_id) ||
+                pendingDeletes.has("all")
+              }
+              onClick={() =>
+                void remove(memory.vector_id, async () => {
                   await api(
                     `/api/agent/memories/${encodeURIComponent(memory.vector_id)}`,
                     { method: "DELETE" },
@@ -675,10 +747,8 @@ function Memories({ api }: { api: Api }) {
                       (item) => item.vector_id !== memory.vector_id,
                     ),
                   );
-                } catch (error) {
-                  setError(errorText(error));
-                }
-              }}
+                })
+              }
             >
               Forget
             </button>
@@ -686,7 +756,14 @@ function Memories({ api }: { api: Api }) {
           <p className="message-text">{memory.content_preview}</p>
         </article>
       ))}
-      {cursor && <button onClick={() => void load(cursor)}>Load more</button>}
+      {cursor && (
+        <button
+          disabled={loading || pendingDeletes.size > 0}
+          onClick={() => void load(cursor)}
+        >
+          Load more
+        </button>
+      )}
       {forget && (
         <div className="notice">
           <h3>Forget all memories</h3>
@@ -712,20 +789,19 @@ function Memories({ api }: { api: Api }) {
             </button>
             <button
               className="danger"
-              disabled={confirmation !== "FORGET"}
-              onClick={async () => {
-                try {
+              disabled={confirmation !== "FORGET" || pendingDeletes.size > 0}
+              onClick={() =>
+                void remove("all", async () => {
                   await api("/api/agent/memories/forget-all", {
                     method: "POST",
                     body: JSON.stringify({ confirm: confirmation }),
                   });
+                  setMemories([]);
+                  setCursor(null);
                   setForget(false);
                   setConfirmation("");
-                  await load();
-                } catch (error) {
-                  setError(errorText(error));
-                }
-              }}
+                })
+              }
             >
               Forget all
             </button>

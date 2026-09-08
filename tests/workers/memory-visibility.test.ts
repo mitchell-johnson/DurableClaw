@@ -28,6 +28,71 @@ function fresh() {
 }
 
 describe("memory visibility on reconstructed coordinator storage", () => {
+  it("upgrades v10 source policy storage without discarding memories or transcript", async () => {
+    const stub = fresh();
+    const user = crypto.randomUUID();
+    await stub.fetch("https://agent/init", {
+      method: "POST",
+      headers: await headers(user),
+      body: JSON.stringify({ conversation_id: "retained" }),
+    });
+    const result = await runInDurableObject(
+      stub,
+      async (original: any, state: DurableObjectState) => {
+        original.appendMessage({
+          conversationId: "retained",
+          role: "user",
+          content: "Retain this transcript",
+        });
+        indexMemory(state.storage.sql, {
+          vector_id: "retained-memory",
+          type: "raw",
+          content: "Retain this memory",
+        });
+        state.storage.sql.exec("DROP TABLE memory_source_messages");
+        state.storage.sql.exec("DROP TABLE memory_excluded_messages");
+        state.storage.sql.exec("DROP TABLE memory_inventory_cursors");
+        state.storage.sql.exec("UPDATE schema_meta SET version = 10");
+        const restored = new NanoChatAgent(state, env as any);
+        await restored.fetch(
+          new Request("https://agent/init", {
+            method: "POST",
+            headers: await headers(user),
+            body: "{}",
+          }),
+        );
+        return {
+          version: state.storage.sql
+            .exec("SELECT version FROM schema_meta")
+            .one().version,
+          sources: state.storage.sql
+            .exec("SELECT * FROM memory_source_messages")
+            .toArray(),
+          excluded: state.storage.sql
+            .exec("SELECT * FROM memory_excluded_messages")
+            .toArray(),
+          cursors: state.storage.sql
+            .exec("SELECT * FROM memory_inventory_cursors")
+            .toArray(),
+          memory: filterWarmMemoryIds(state.storage.sql, ["retained-memory"]),
+          messages: state.storage.sql
+            .exec(
+              "SELECT content FROM messages WHERE conversation_id = ?",
+              "retained",
+            )
+            .toArray(),
+        };
+      },
+    );
+    expect(result).toEqual({
+      version: 11,
+      sources: [],
+      excluded: [],
+      cursors: [],
+      memory: ["retained-memory"],
+      messages: [{ content: "Retain this transcript" }],
+    });
+  });
   it("creates the deletion table during v9 upgrade and keeps a deleted ID hidden after reconstruction", async () => {
     const stub = fresh();
     const user = crypto.randomUUID();
@@ -144,7 +209,7 @@ describe("memory visibility on reconstructed coordinator storage", () => {
       [];
     do {
       const response = await stub.fetch(
-        `https://agent/memories?limit=2${cursor ? `&cursor=${cursor}` : ""}`,
+        `https://agent/memories?limit=2${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`,
         { headers: await headers(user) },
       );
       expect(response.status).toBe(200);
@@ -154,9 +219,10 @@ describe("memory visibility on reconstructed coordinator storage", () => {
       cursor = body.next_cursor;
       expect(pages.length).toBeLessThan(10);
     } while (cursor);
-    expect(pages[0]).toMatchObject({ memories: [], next_cursor: "2" });
-    expect(pages[1]).toMatchObject({ next_cursor: "4" });
+    expect(pages[0].memories).toHaveLength(2);
+    expect(pages[0].next_cursor).toBeTruthy();
+    expect(pages[1].next_cursor).toBeNull();
     expect(found).toEqual(["visible-memory", "cold-source", "visible-insight"]);
-    expect(pages).toHaveLength(5);
+    expect(pages).toHaveLength(2);
   });
 });

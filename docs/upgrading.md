@@ -18,4 +18,6 @@ Original flat R2 workspace objects are retained, but the new file tools use priv
 
 Old SDK schedules are not converted into new jobs automatically. Recreate desired reminders after upgrade. The previous WhatsApp channel module was an unconnected prototype; this runtime exposes generic authenticated events and inbox integration instead of claiming a working messaging transport.
 
+Owner SQLite storage upgrades add content-free source-message exclusion records for memory forgetting. No transcript is removed by that migration. Existing version-1 MCP credential envelopes remain usable only from their persisted server configuration and upgrade to context-bound encryption when saved unchanged. Changing the server name or URL requires entering its credentials again. Legacy import record IDs distinguish message, summary, memory, and session identities while retaining matching records from earlier imports.
+
 There is no automatic rollback migration. Back up/export data before changing runtime versions and test against a copy of your installation. Returning to the old unauthenticated routing would not expose new authenticated conversation history under its old session identifiers.

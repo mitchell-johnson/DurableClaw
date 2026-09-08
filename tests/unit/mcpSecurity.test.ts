@@ -61,19 +61,33 @@ describe("MCP trust boundary", () => {
       /^MCP server returned 403$/,
     );
   });
-  it("rejects malformed decrypted headers even with authenticated ciphertext", async () => {
+  it("rejects malformed headers before encryption and rejects ciphertext under another key", async () => {
     const env = { MCP_CREDENTIALS_SECRET: "test-key-material-only" };
-    const encrypted = await encryptCredentials(env, {
-      Authorization: "first\r\nInjected: second",
-    });
-    await expect(decryptCredentials(env, encrypted)).rejects.toThrow(
-      "valid string headers",
-    );
+    const scope = {
+      userId: "owner",
+      workspaceId: "default",
+      serverName: "example",
+      serverUrl: "https://mcp.example.invalid",
+    };
+    await expect(
+      encryptCredentials(
+        env,
+        {
+          Authorization: "first\r\nInjected: second",
+        },
+        scope,
+      ),
+    ).rejects.toThrow("valid string headers");
     const other = { MCP_CREDENTIALS_SECRET: "other-key-material-only" };
     await expect(
       decryptCredentials(
         other,
-        await encryptCredentials(env, { Authorization: "Bearer example" }),
+        await encryptCredentials(
+          env,
+          { Authorization: "Bearer example" },
+          scope,
+        ),
+        scope,
       ),
     ).rejects.toThrow();
   });

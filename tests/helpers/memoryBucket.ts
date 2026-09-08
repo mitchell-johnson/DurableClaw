@@ -17,12 +17,15 @@ export function createMemoryBucket(pageSize = 1000) {
       for (const key of Array.isArray(keys) ? keys : [keys])
         objects.delete(key);
     },
-    async list(options: { prefix: string; cursor?: string }) {
+    async list(options: { prefix: string; cursor?: string; limit?: number }) {
       const all = [...objects.keys()]
         .filter((key) => key.startsWith(options.prefix))
         .sort();
       const offset = Number(options.cursor ?? "0");
-      const keys = all.slice(offset, offset + pageSize);
+      const keys = all.slice(
+        offset,
+        offset + Math.min(pageSize, options.limit ?? pageSize),
+      );
       const truncated = offset + keys.length < all.length;
       return {
         objects: keys.map((key) => ({ key })),

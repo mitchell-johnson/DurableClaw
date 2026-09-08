@@ -13,10 +13,11 @@
  *   - 256-bit key derived from `env.MCP_CREDENTIALS_SECRET` via HKDF with a
  *     stable `info` label and salt so re-deriving on the next request
  *     produces the same key. `MCP_CREDENTIALS_SECRET` is already a high-entropy
- *     secret (BetterAuth signing key), suitable as HKDF input keying
+ *     dedicated random secret, suitable as HKDF input keying
  *     material.
  *   - 12-byte random IV per encryption (NIST-recommended for GCM).
- *   - Output: base64(IV || ciphertext) — a single self-describing string.
+ *   - Output: v2:base64(IV || ciphertext). Owner, workspace, server name and
+ *     canonical destination URL are authenticated additional data.
  *
  * Threat model: the goal is "anyone with read access to the DO storage cannot
  * pop out raw bearer tokens". A full break still requires `MCP_CREDENTIALS_SECRET`,
@@ -26,6 +27,53 @@
 const HKDF_INFO = "durableclaw-mcp-credentials-v1";
 const HKDF_SALT = "durableclaw-mcp";
 const IV_LENGTH = 12; // bytes — standard AES-GCM IV size
+const VERSION_PREFIX = "v2:";
+export interface McpCredentialScope {
+  userId: string;
+  workspaceId: string;
+  serverName: string;
+  serverUrl: string;
+}
+function associatedData(scope: McpCredentialScope): Uint8Array<ArrayBuffer> {
+  if (
+    !scope?.userId ||
+    !scope.workspaceId ||
+    !scope.serverName ||
+    !scope.serverUrl
+  )
+    throw new Error("MCP credential scope is required");
+  return new TextEncoder().encode(
+    JSON.stringify([
+      VERSION_PREFIX,
+      scope.userId,
+      scope.workspaceId,
+      scope.serverName,
+      new URL(scope.serverUrl).href,
+    ]),
+  );
+}
+export function validateMcpHeaders(
+  payload: unknown,
+): asserts payload is Record<string, string> {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload))
+    throw new Error("MCP credentials must contain valid string headers");
+  const entries = Object.entries(payload);
+  if (
+    entries.length > 32 ||
+    entries.some(
+      ([key, value]) =>
+        key.length > 128 ||
+        !/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(key) ||
+        typeof value !== "string" ||
+        /[\x00-\x1f\x7f]/.test(value) ||
+        value.length > 8192,
+    ) ||
+    new TextEncoder().encode(JSON.stringify(payload)).byteLength > 10_000
+  )
+    throw new Error(
+      "MCP credentials must contain valid string headers within size limits",
+    );
+}
 
 /**
  * Minimal env shape required by the crypto helpers. Defined locally rather
@@ -106,19 +154,25 @@ function base64ToBytes(b64: string): Uint8Array {
 export async function encryptCredentials(
   env: McpCryptoEnv,
   payload: Record<string, string>,
+  scope: McpCredentialScope,
 ): Promise<string> {
+  validateMcpHeaders(payload);
   const key = await deriveKey(env);
   const iv = crypto.getRandomValues(new Uint8Array(IV_LENGTH));
   const plaintext = new TextEncoder().encode(JSON.stringify(payload));
   const ciphertext = new Uint8Array(
-    await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plaintext),
+    await crypto.subtle.encrypt(
+      { name: "AES-GCM", iv, additionalData: associatedData(scope) },
+      key,
+      plaintext,
+    ),
   );
   // Concatenate IV || ciphertext so decrypt can split without a separate
   // metadata blob.
   const out = new Uint8Array(iv.length + ciphertext.length);
   out.set(iv, 0);
   out.set(ciphertext, iv.length);
-  return bytesToBase64(out);
+  return VERSION_PREFIX + bytesToBase64(out);
 }
 
 /**
@@ -132,8 +186,28 @@ export async function encryptCredentials(
 export async function decryptCredentials(
   env: McpCryptoEnv,
   ciphertext: string,
+  scope: McpCredentialScope,
 ): Promise<Record<string, string>> {
-  const bytes = base64ToBytes(ciphertext);
+  if (!ciphertext.startsWith(VERSION_PREFIX))
+    throw new Error(
+      "Legacy MCP credentials require trusted stored configuration",
+    );
+  return decryptStoredCredentials(env, ciphertext, scope);
+}
+
+/** Only call on an existing server read from the owner's durable persona row. */
+export async function decryptStoredCredentials(
+  env: McpCryptoEnv,
+  ciphertext: string,
+  scope: McpCredentialScope,
+): Promise<Record<string, string>> {
+  const aad = associatedData(scope);
+  const scoped = ciphertext.startsWith(VERSION_PREFIX);
+  // Legacy blobs can only come from an existing persisted server configuration.
+  // The persona boundary disallows submitting or retargeting an arbitrary blob.
+  const bytes = base64ToBytes(
+    scoped ? ciphertext.slice(VERSION_PREFIX.length) : ciphertext,
+  );
   if (bytes.length <= IV_LENGTH) {
     throw new Error("encrypted credentials blob is truncated");
   }
@@ -142,26 +216,16 @@ export async function decryptCredentials(
 
   const key = await deriveKey(env);
   const plaintextBuf = await crypto.subtle.decrypt(
-    { name: "AES-GCM", iv: new Uint8Array(iv) },
+    {
+      name: "AES-GCM",
+      iv: new Uint8Array(iv),
+      ...(scoped ? { additionalData: aad } : {}),
+    },
     key,
     new Uint8Array(data),
   );
   const text = new TextDecoder().decode(plaintextBuf);
   const parsed = JSON.parse(text) as unknown;
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error("decrypted MCP credentials payload is not an object");
-  }
-  if (
-    Object.entries(parsed).some(
-      ([key, value]) =>
-        !/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(key) ||
-        typeof value !== "string" ||
-        /[\r\n]/.test(value),
-    )
-  ) {
-    throw new Error(
-      "decrypted MCP credentials must contain valid string headers",
-    );
-  }
-  return parsed as Record<string, string>;
+  validateMcpHeaders(parsed);
+  return parsed;
 }

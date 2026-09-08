@@ -81,6 +81,43 @@ const SUPPORTED_VERSIONS = new Set([
 const MCP_CLIENT_INFO = { name: "durableclaw", version: "1.0" };
 const DEFAULT_DISCOVERY_TIMEOUT_MS = 5_000;
 const DEFAULT_CALL_TIMEOUT_MS = 30_000;
+export const MAX_MCP_CATALOG_BYTES = 512 * 1024;
+export const MAX_MCP_TOTAL_CATALOG_BYTES = 1024 * 1024;
+const MAX_MCP_SCHEMA_BYTES = 128 * 1024;
+
+/** Schema keywords, references and literal values are data, never rewritten. */
+function boundedMcpSchema(value: unknown): object | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    throw new Error("MCP tool input schema must be an object");
+  const pending = [{ value, depth: 0 }];
+  let nodes = 0;
+  while (pending.length) {
+    const item = pending.pop()!;
+    if (++nodes > 10_000 || item.depth > 64)
+      throw new Error("MCP input schema exceeds complexity limit");
+    if (item.value && typeof item.value === "object")
+      for (const child of Object.values(item.value))
+        pending.push({ value: child, depth: item.depth + 1 });
+  }
+  if (
+    new TextEncoder().encode(JSON.stringify(value)).byteLength >
+    MAX_MCP_SCHEMA_BYTES
+  )
+    throw new Error("MCP input schema exceeds size limit");
+  return value;
+}
+export function mcpCatalogBytes(tools: MCPTool[]): number {
+  return new TextEncoder().encode(JSON.stringify(tools)).byteLength;
+}
+/** Configuration identity includes credential rotation, without exposing it in a tool name. */
+export function mcpServerFingerprint(server: MCPServerConfig): string {
+  return JSON.stringify([
+    server.name,
+    new URL(server.url).href,
+    server.headers_encrypted ?? null,
+  ]);
+}
 
 /** Parse a literal dotted-decimal IPv4 address into 4 octets, or null. */
 function parseIPv4(input: string): [number, number, number, number] | null {
@@ -229,7 +266,7 @@ export function isPrivateOrInternalHost(hostname: string): boolean {
  * parsed URL on success, throws a stable error message on failure (route + DO
  * log it). Applied in both discovery and call paths.
  */
-function requireHttpsURL(raw: string): URL {
+export function requireHttpsURL(raw: string): URL {
   let parsed: URL;
   try {
     parsed = new URL(raw);
@@ -386,6 +423,7 @@ export async function discoverMCPTools(args: {
     const out: MCPTool[] = [];
     const names = new Set<string>();
     const cursors = new Set<string>();
+    let catalogBytes = 2;
     let cursor: string | undefined;
     do {
       const result = (await jsonRpcRequest(
@@ -405,17 +443,18 @@ export async function discoverMCPTools(args: {
         )
           continue;
         names.add(item.name);
-        out.push({
+        const discovered: MCPTool = {
           name: item.name,
           description:
             typeof item.description === "string"
               ? sanitizeToolOutput(item.description).slice(0, 8000)
               : undefined,
-          inputSchema:
-            item.inputSchema && typeof item.inputSchema === "object"
-              ? (sanitizeMCPValue(item.inputSchema) as object)
-              : undefined,
-        });
+          inputSchema: boundedMcpSchema(item.inputSchema),
+        };
+        catalogBytes += mcpCatalogBytes([discovered]);
+        if (catalogBytes > MAX_MCP_CATALOG_BYTES)
+          throw new Error("MCP tool catalog exceeds byte limit");
+        out.push(discovered);
         if (out.length > 200)
           throw new Error("MCP tool catalog exceeds size limit");
       }
@@ -443,10 +482,12 @@ export async function callMCPTool(args: {
   tool_args: unknown;
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
+  beforeCall?: () => void | Promise<void>;
 }): Promise<unknown> {
   const connection = connect(args, DEFAULT_CALL_TIMEOUT_MS);
   try {
     await initialize(connection);
+    await args.beforeCall?.();
     return sanitizeMCPValue(
       await jsonRpcRequest(connection, "tools/call", {
         name: args.tool_name,

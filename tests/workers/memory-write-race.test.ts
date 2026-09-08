@@ -96,6 +96,7 @@ it.each([
                 conversationId: "race",
                 assistantMessageId: messageId,
                 memoryEnabled: true,
+                memoryEpoch: writer.memoryWriteEpoch,
                 userMessage: "Private content to forget",
                 fullText: "Private response",
                 finishReason: "stop",

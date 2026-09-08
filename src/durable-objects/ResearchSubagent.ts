@@ -563,8 +563,12 @@ export class ResearchSubagent implements DurableObject {
       this.filterMemoryIds(task, ids, signal);
     const fullToolset = buildSubagentToolset({ retrievalContext });
     const requestedToolIds = new Set(task.toolset);
+    const currentToolIds = await this.readToolPolicy(task, signal);
+    checkDeadline();
     const tools = Object.fromEntries(
-      Object.entries(fullToolset).filter(([id]) => requestedToolIds.has(id)),
+      Object.entries(fullToolset).filter(
+        ([id]) => requestedToolIds.has(id) && currentToolIds.has(id),
+      ),
     ) as typeof fullToolset;
     if (Object.keys(tools).length === 0)
       throw new Error(
@@ -577,14 +581,25 @@ export class ResearchSubagent implements DurableObject {
       if (execute)
         tools[id] = {
           ...tool,
-          execute: (input, options) => {
+          execute: async (input, options) => {
             checkDeadline();
-            return withAbort(
+            if (!(await this.readToolPolicy(task, signal)).has(id))
+              throw new Error(
+                "Research tool is disabled by the current persona policy",
+              );
+            checkDeadline();
+            const result = await withAbort(
               Promise.resolve(
                 execute(input, { ...options, abortSignal: signal }),
               ),
               signal,
             );
+            if (!(await this.readToolPolicy(task, signal)).has(id))
+              throw new Error(
+                "Research tool is disabled by the current persona policy",
+              );
+            checkDeadline();
+            return result;
           },
         };
     }
@@ -623,6 +638,44 @@ export class ResearchSubagent implements DurableObject {
         Date.now() - modelStartedAt,
       );
     }
+  }
+
+  private async readToolPolicy(
+    task: SubagentDispatch,
+    signal: AbortSignal,
+  ): Promise<Set<string>> {
+    signal.throwIfAborted();
+    const deadline = AbortSignal.any([signal, AbortSignal.timeout(5_000)]);
+    const headers = await createInternalAuthHeaders(
+      {
+        userId: task.context.user_id,
+        organizationId: task.context.organization_id,
+        tenantBinding: task.context.tenant_binding,
+        role: task.context.user_role,
+      },
+      this.env.INTERNAL_AUTH_SECRET,
+    );
+    const stub = this.env.NANO_CHAT_AGENT.get(
+      this.env.NANO_CHAT_AGENT.idFromName(task.coordinator_do_name),
+    );
+    const response = await withAbort(
+      stub.fetch(
+        new Request("https://do/tool-policy", { headers, signal: deadline }),
+      ),
+      deadline,
+    );
+    if (!response.ok) throw new Error("Research tool policy unavailable");
+    const body = (await withAbort(response.json(), deadline)) as {
+      tools?: unknown;
+    } | null;
+    if (
+      !body ||
+      !Array.isArray(body.tools) ||
+      body.tools.length > 20 ||
+      body.tools.some((id) => typeof id !== "string")
+    )
+      throw new Error("Research tool policy invalid");
+    return new Set(body.tools as string[]);
   }
 
   private async filterMemoryIds(
