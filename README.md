@@ -9,13 +9,14 @@ One coordinator object owns a user's conversations within a workspace. Independe
 - Streaming conversations with durable tool history, reconnect replay, stable message IDs, pagination, and request cancellation.
 - Up to 100 concurrently running research tasks per owner, with bounded dispatch, read-only tools, absolute deadlines, partial failure reporting, retryable callbacks, and separate research cancellation.
 - Conversation-scoped tool closures and page context. Background findings appear as their own durable message.
+- Internet browsing through Cloudflare Browser Run, with conversation-scoped sessions, page reading, and approved website interactions.
 - Explicit and automatic memory, semantic search, linked references, rolling summaries, warm/cold recall tiers, provenance, and retryable forgetting.
 - Deferred conversation titles, memory compression, and opt-in consolidation through a durable OpenRouter Batch API outbox.
 - Opt-in proactive checks with event cursors, deduplication, daily budgets, a zero-model quiet path, research synthesis, and a durable inbox.
 - Server-issued, argument-bound approvals for file mutations and remote MCP tools. Configurable persona, response depth, tool policy, and encrypted MCP credentials.
 - Invocation-owned OpenTelemetry exports, including cold alarms, with bounded buffering and flushing.
 
-See [architecture](ARCHITECTURE.md), [API and integration contracts](docs/api.md), [runtime guarantees](docs/runtime.md), and [upgrading existing installations](docs/upgrading.md).
+See [architecture](ARCHITECTURE.md), [API and integration contracts](docs/api.md), [runtime guarantees](docs/runtime.md), [browser setup and operation](docs/browsing.md), and [upgrading existing installations](docs/upgrading.md).
 
 ## Local setup
 

@@ -1,5 +1,7 @@
 # Upgrading an existing installation
 
+Browser tools add the optional `[browser]` binding in `wrangler.toml` and `@cloudflare/puppeteer` to the lockfile. Preserve that binding when merging your deployment settings to enable browsing. No new Durable Object migration is needed; see [browser setup](browsing.md).
+
 The `NanoChatAgent` class and the existing `v1` migration are retained. The `v2` migration adds `ResearchSubagent`. Original SQLite tables and R2 objects remain stored. New sessions route by authenticated user/workspace rather than an unauthenticated browser session name.
 
 Before updating, record the old browser session identifier from its URL fragment or the `durableclaw-session` local-storage entry. Keep that identifier private; the old installation did not attach ownership records to sessions.

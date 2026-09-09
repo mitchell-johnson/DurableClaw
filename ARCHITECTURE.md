@@ -14,6 +14,7 @@ flowchart TD
     Children --> Models
     Coordinator --> Memory[Workers AI + Vectorize + R2 inventory]
     Coordinator --> Files[Private R2 workspace]
+    Coordinator --> Web[Browser Run: one session per conversation]
     Coordinator --> Inbox[D1 events and inbox]
 ```
 
@@ -48,6 +49,8 @@ Housekeeping tasks persist request payloads, dedupe keys, batch receipts, result
 R2 holds an exact remote inventory; Vectorize provides similarity; DO SQLite owns source links, warm/cold tiers, deletion intent, and forget barriers. Consolidation stages insights cold until their result is complete, then archives cited sources to the cold tier. Forgetting an insight restores surviving sources. Forgetting source content follows transitive provenance and keeps cleanup retries durable.
 
 Generic seams are `RetrievalAdapter`, the authentication service, proactive observers, inbox publication, model configuration, and MCP servers. The bundled implementation searches private files and observes authenticated workspace events. It contains no application-specific database catalog, permissions policy, or business workflow.
+
+The optional `BROWSER` binding gives the foreground coordinator native browser tools. `BrowserSessions` stores a remote session ID and observed-page metadata in the owning object's key/value storage under a conversation key, serializes operations within that conversation, and disconnects CDP between calls. Cookies and live pages remain in Cloudflare's browser until explicit closure or idle expiry. Website actions use the existing durable approval flow; research children retain their existing read-only workspace toolset. See [browsing](docs/browsing.md).
 
 ## Source map
 

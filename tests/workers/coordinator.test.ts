@@ -38,6 +38,43 @@ async function init(stub: any, conversation: string) {
 }
 
 describe("assembled coordinator on native storage", () => {
+  it("registers conversation-scoped browser tools and closes them on deletion", async () => {
+    const stub = fresh();
+    await init(stub, "browser-one");
+    await init(stub, "browser-two");
+    await runInDurableObject(stub, async (agent: any) => {
+      const initial = await agent.ensureTools("browser-one");
+      expect(initial.browser_navigate).toBeUndefined();
+      const navigated: string[] = [];
+      const closed: string[] = [];
+      agent.browserSessions = {
+        navigate: async (id: string) => {
+          navigated.push(id);
+          return { title: id };
+        },
+        close: async (id: string) => {
+          closed.push(id);
+          return { closed: true };
+        },
+      };
+      const one = await agent.ensureTools("browser-one");
+      const two = await agent.ensureTools("browser-two");
+      const options = { toolCallId: "browse", messages: [] };
+      await one.browser_navigate.execute(
+        { url: "https://example.com" },
+        options,
+      );
+      await two.browser_navigate.execute(
+        { url: "https://example.com" },
+        options,
+      );
+      expect(navigated).toEqual(["browser-one", "browser-two"]);
+      expect(agent.allowedResearchToolIds()).not.toContain("browser_act");
+      expect(agent.handleDeleteConversation("browser-one").status).toBe(200);
+      expect(closed).toEqual(["browser-one"]);
+    });
+  });
+
   it("persists owner and history across reconstruction and rejects another signed owner", async () => {
     const stub = fresh();
     expect((await init(stub, "history")).status).toBe(200);
