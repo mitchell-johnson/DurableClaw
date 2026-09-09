@@ -38,6 +38,32 @@ async function init(stub: any, conversation: string) {
 }
 
 describe("assembled coordinator on native storage", () => {
+  it("closes idle browser sessions on cancellation without cancelling a different active request", async () => {
+    const stub = fresh();
+    await init(stub, "browser-stop");
+    await runInDurableObject(stub, async (agent: any) => {
+      const closed: string[] = [];
+      agent.browserSessions = {
+        close: async (id: string) => {
+          closed.push(id);
+        },
+      };
+      const controller = new AbortController();
+      agent.activeTurns.set("browser-stop", {
+        requestId: "current",
+        controller,
+      });
+      agent.handleCancelTurn("browser-stop", "old", true);
+      expect(closed).toEqual([]);
+      expect(controller.signal.aborted).toBe(false);
+      agent.handleCancelTurn("browser-stop", "current", true);
+      expect(controller.signal.aborted).toBe(true);
+      expect(closed).toEqual(["browser-stop"]);
+      agent.handleCancelTurn("browser-stop", undefined, true);
+      expect(closed).toEqual(["browser-stop", "browser-stop"]);
+    });
+  });
+
   it("registers conversation-scoped browser tools and closes them on deletion", async () => {
     const stub = fresh();
     await init(stub, "browser-one");

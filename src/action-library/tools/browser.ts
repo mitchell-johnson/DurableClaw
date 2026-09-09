@@ -10,13 +10,10 @@ import {
   browserActionsSchema,
   requireBrowserURL,
   type BrowserAction,
+  type BrowserSelection,
 } from "../../services/browser/BrowserSessions";
 
-const actionProperties = {
-  type: {
-    type: "string",
-    enum: ["click", "fill", "select", "press", "scroll"],
-  },
+const actionFields = {
   selector: { type: "string", minLength: 1, maxLength: 1000 },
   value: { type: "string", maxLength: 8000 },
   key: {
@@ -25,6 +22,31 @@ const actionProperties = {
   },
   delta_y: { type: "integer", minimum: -5000, maximum: 5000 },
 };
+
+const actionVariants = [
+  { type: "click", fields: { selector: actionFields.selector } },
+  {
+    type: "fill",
+    fields: { selector: actionFields.selector, value: actionFields.value },
+  },
+  {
+    type: "select",
+    fields: {
+      selector: actionFields.selector,
+      value: { type: "string", maxLength: 1000 },
+    },
+  },
+  {
+    type: "press",
+    fields: { selector: actionFields.selector, key: actionFields.key },
+  },
+  { type: "scroll", fields: { delta_y: actionFields.delta_y } },
+].map(({ type, fields }) => ({
+  type: "object",
+  properties: { type: { type: "string", const: type }, ...fields },
+  required: ["type", ...Object.keys(fields)],
+  additionalProperties: false,
+}));
 
 export function createBrowserTools(args: {
   sessions?: BrowserSessions;
@@ -54,10 +76,18 @@ export function createBrowserTools(args: {
     }
   };
   return {
-    browser_navigate: defineTool<{ url: string }>({
+    browser_navigate: defineTool<{ url: string; engine?: BrowserSelection }>({
       description:
-        "Open a public HTTP(S) page in a real Cloudflare browser, rendering JavaScript. Returns page text, links and an accessibility tree. Session state is private to this conversation; idle sessions expire after 10 minutes.",
-      properties: { url: { type: "string", maxLength: 8000 } },
+        "Open a public HTTP(S) page. Prefer engine=auto: new tasks use Kitesurf, existing sessions keep their engine. Choose chromium for persistent login sessions, work that must resume after a restart, video/WebGL, or pages incompatible with Kitesurf. Explicit engine changes discard the current browser state and require fresh action approval. Returns browser_engine, page text, links and an accessibility tree. Kitesurf sessions cannot be reconnected after connection loss; both engines close after 10 idle minutes.",
+      properties: {
+        url: { type: "string", maxLength: 8000 },
+        engine: {
+          type: "string",
+          enum: ["auto", "kitesurf", "chromium"],
+          description:
+            "Defaults to auto (prefer Kitesurf). Use chromium when the task needs the full browser environment, or to reopen an incompatible page. Use kitesurf to explicitly start a fresh lightweight task after Chromium.",
+        },
+      },
       required: ["url"],
       execute: (i) =>
         output(() =>
@@ -65,6 +95,7 @@ export function createBrowserTools(args: {
             conversation(),
             requireBrowserURL(i.url),
             args.signal,
+            i.engine,
           ),
         ),
     }),
@@ -92,10 +123,7 @@ export function createBrowserTools(args: {
             minItems: 1,
             maxItems: 8,
             items: {
-              type: "object",
-              properties: actionProperties,
-              required: ["type"],
-              additionalProperties: false,
+              anyOf: actionVariants,
             },
           },
         },
@@ -103,9 +131,9 @@ export function createBrowserTools(args: {
         buildPreview: async (i) => {
           const actions = browserActionsSchema.parse(i.actions);
           const url = await sessions.snapshotURL(conversation(), i.snapshot_id);
-          return sanitizeToolOutput(
-            `Interact with ${url}:\n${JSON.stringify(actions, null, 2)}`,
-          );
+          // This is the human approval preview. Preserve the exact submitted
+          // text, even when it contains markers filtered from page results.
+          return `Interact with ${url}:\n${JSON.stringify(actions, null, 2)}`;
         },
         execute: (i) =>
           output(async () => {
