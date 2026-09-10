@@ -177,6 +177,108 @@ describe("useAgentChat", () => {
     ]);
   });
 
+  it.each([false, true])(
+    "upserts a background reply lifecycle and replay without duplicates (replayed first: %s)",
+    async (replayedFirst) => {
+      const { result } = renderHook(() =>
+        useAgentChat({ endpoints: endpoints() }),
+      );
+      await act(async () => {
+        await result.current.connect();
+      });
+      const socket = wsConstructions[0];
+      const identity = {
+        request_id: "batch-result",
+        parent_request_id: "original",
+        message_id: "findings",
+        batch_id: "batch-result",
+      };
+      act(() => {
+        socket.emit({ type: "assistant_start", request_id: "original" });
+        socket.emit({
+          type: "assistant_delta",
+          request_id: "original",
+          content: "I am investigating.",
+        });
+        socket.emit({ type: "assistant_end", request_id: "original" });
+        if (replayedFirst)
+          socket.emit({
+            type: "assistant_message",
+            message_id: "findings",
+            content: "All 20 completed.",
+          });
+        for (let attempt = 0; attempt < 2; attempt++) {
+          socket.emit({ type: "assistant_start", ...identity });
+          socket.emit({
+            type: "assistant_delta",
+            ...identity,
+            content: "All 20 completed.",
+          });
+          socket.emit({ type: "assistant_end", ...identity });
+          socket.emit({
+            type: "assistant_message",
+            ...identity,
+            content: "All 20 completed.",
+          });
+        }
+      });
+      expect(result.current.messages.map((m) => m.content)).toEqual([
+        "I am investigating.",
+        "All 20 completed.",
+      ]);
+      expect(result.current.isStreaming).toBe(false);
+      expect(result.current.isLoading).toBe(false);
+    },
+  );
+
+  it("keeps a newer foreground reply active when a batch reply lifecycle arrives", async () => {
+    const { result } = renderHook(() =>
+      useAgentChat({ endpoints: endpoints() }),
+    );
+    await act(async () => {
+      await result.current.connect();
+    });
+    const socket = wsConstructions[0];
+    act(() => {
+      socket.emit({ type: "assistant_start", request_id: "new" });
+      socket.emit({
+        type: "assistant_delta",
+        request_id: "new",
+        content: "New ",
+      });
+      const identity = {
+        request_id: "batch-result",
+        parent_request_id: "original",
+        message_id: "findings",
+      };
+      socket.emit({ type: "assistant_start", ...identity });
+      socket.emit({
+        type: "assistant_delta",
+        ...identity,
+        content: "Background answer",
+      });
+      socket.emit({ type: "assistant_end", ...identity });
+      socket.emit({
+        type: "assistant_message",
+        ...identity,
+        content: "Background answer",
+      });
+      socket.emit({
+        type: "assistant_delta",
+        request_id: "new",
+        content: "answer",
+      });
+    });
+    expect(result.current.isStreaming).toBe(true);
+    act(() => {
+      socket.emit({ type: "assistant_end", request_id: "new" });
+    });
+    expect(result.current.messages.map((m) => m.content)).toEqual([
+      "New answer",
+      "Background answer",
+    ]);
+  });
+
   it("ignores frames for a finished request while a different request is streaming", async () => {
     const { result } = renderHook(() =>
       useAgentChat({ endpoints: endpoints() }),
