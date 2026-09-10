@@ -7,6 +7,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 const chat = vi.hoisted(() => ({
   connect: vi.fn(async () => {}),
@@ -15,7 +16,8 @@ const chat = vi.hoisted(() => ({
   cancelResearch: vi.fn(),
   reset: vi.fn(),
   newConversation: vi.fn(),
-  conversations: [],
+  switchConversation: vi.fn(async () => {}),
+  conversations: [{ id: "conversation", title: "A recent conversation" }],
   messages: [
     { role: "assistant", content: "Ready to write the reviewed file." },
   ],
@@ -41,8 +43,35 @@ const chat = vi.hoisted(() => ({
 }));
 vi.mock("../../src/hooks/useAgentChat", () => ({ useAgentChat: () => chat }));
 import { App } from "../../src/app";
+let compact = false;
+let touch = false;
+const mediaListeners = new Set<() => void>();
 beforeEach(() => {
   vi.clearAllMocks();
+  compact = false;
+  touch = false;
+  mediaListeners.clear();
+  vi.stubGlobal("matchMedia", (query: string) => ({
+    get matches() {
+      return query === "(pointer: coarse)" ? touch : compact;
+    },
+    addEventListener: (_: string, listener: () => void) =>
+      mediaListeners.add(listener),
+    removeEventListener: (_: string, listener: () => void) =>
+      mediaListeners.delete(listener),
+  }));
+  Object.defineProperty(HTMLDialogElement.prototype, "showModal", {
+    configurable: true,
+    value: function () {
+      this.setAttribute("open", "");
+    },
+  });
+  Object.defineProperty(HTMLDialogElement.prototype, "close", {
+    configurable: true,
+    value: function () {
+      this.removeAttribute("open");
+    },
+  });
   chat.conversationId = "conversation";
   Object.defineProperty(Element.prototype, "scrollIntoView", {
     value: vi.fn(),
@@ -63,6 +92,121 @@ async function login() {
   await screen.findByText("Conversation", { selector: "h2" });
 }
 describe("workspace interface", () => {
+  it("opens mobile navigation on demand and closes it after selecting a conversation", async () => {
+    compact = true;
+    vi.stubGlobal("fetch", async () => Response.json({ success: true }));
+    await login();
+    expect(screen.queryByRole("navigation")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Open navigation" }));
+    const drawer = screen.getByRole("dialog");
+    fireEvent.click(within(drawer).getByText("A recent conversation"));
+    expect(chat.switchConversation).toHaveBeenCalledWith(chat.conversations[0]);
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.getByLabelText("Message")).toBeTruthy();
+  });
+
+  it("preserves the draft while navigating and supports dismissing the drawer", async () => {
+    compact = true;
+    vi.stubGlobal("fetch", async () => Response.json({ persona: {} }));
+    await login();
+    fireEvent.change(screen.getByLabelText("Message"), {
+      target: { value: "Unsent draft" },
+    });
+    const openMenu = () =>
+      fireEvent.click(screen.getByRole("button", { name: "Open navigation" }));
+    openMenu();
+    fireEvent.click(screen.getByText("Settings", { exact: true }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    await screen.findByLabelText("Agent instructions");
+    openMenu();
+    fireEvent.click(screen.getByText("Conversations", { exact: true }));
+    expect(screen.getByLabelText("Message")).toHaveProperty(
+      "value",
+      "Unsent draft",
+    );
+    openMenu();
+    fireEvent(
+      screen.getByRole("dialog"),
+      new Event("cancel", { cancelable: true }),
+    );
+    expect(screen.queryByRole("dialog")).toBeNull();
+    openMenu();
+    fireEvent.click(screen.getByLabelText("Close navigation"));
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("restores desktop navigation on resize without leaving an open mobile dialog", async () => {
+    compact = true;
+    vi.stubGlobal("fetch", async () => Response.json({ success: true }));
+    await login();
+    fireEvent.click(screen.getByLabelText("Open navigation"));
+    act(() => {
+      compact = false;
+      mediaListeners.forEach((listener) => listener());
+    });
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.getByRole("navigation")).toBeTruthy();
+    act(() => {
+      compact = true;
+      mediaListeners.forEach((listener) => listener());
+    });
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.queryByRole("navigation")).toBeNull();
+  });
+
+  it("leaves touch Enter for newlines while keeping desktop Enter to send", async () => {
+    touch = true;
+    vi.stubGlobal("fetch", async () => Response.json({ success: true }));
+    await login();
+    const input = screen.getByLabelText("Message");
+    fireEvent.change(input, { target: { value: "A message" } });
+    expect(fireEvent.keyDown(input, { key: "Enter" })).toBe(true);
+    expect(chat.sendMessage).not.toHaveBeenCalled();
+    touch = false;
+    expect(fireEvent.keyDown(input, { key: "Enter", shiftKey: true })).toBe(
+      true,
+    );
+    expect(fireEvent.keyDown(input, { key: "Enter", isComposing: true })).toBe(
+      true,
+    );
+    expect(chat.sendMessage).not.toHaveBeenCalled();
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() =>
+      expect(chat.sendMessage).toHaveBeenCalledWith("A message"),
+    );
+  });
+
+  it("tracks keyboard viewport changes, ignores pinch zoom and cleans up on sign out", async () => {
+    compact = true;
+    const viewport = Object.assign(new EventTarget(), {
+      height: 800,
+      offsetTop: 0,
+      scale: 1,
+    });
+    vi.stubGlobal("visualViewport", viewport);
+    const remove = vi.spyOn(viewport, "removeEventListener");
+    vi.stubGlobal("fetch", async () => Response.json({ success: true }));
+    await login();
+    const workspace = document.querySelector<HTMLElement>(".workspace")!;
+    viewport.height = 400;
+    viewport.offsetTop = 50;
+    viewport.dispatchEvent(new Event("resize"));
+    expect(workspace.style.getPropertyValue("--workspace-height")).toBe(
+      "400px",
+    );
+    expect(workspace.style.getPropertyValue("--workspace-top")).toBe("50px");
+    viewport.scale = 2;
+    viewport.height = 200;
+    viewport.dispatchEvent(new Event("resize"));
+    expect(workspace.style.getPropertyValue("--workspace-height")).toBe(
+      "400px",
+    );
+    fireEvent.click(screen.getByLabelText("Open navigation"));
+    fireEvent.click(screen.getByText("Sign out"));
+    expect(remove).toHaveBeenCalledWith("resize", expect.any(Function));
+    expect(remove).toHaveBeenCalledWith("scroll", expect.any(Function));
+  });
+
   it("signs in without writing credentials to browser storage and clears the workspace at sign out", async () => {
     vi.stubGlobal("fetch", async () => Response.json({ success: true }));
     const storage = vi.spyOn(Storage.prototype, "setItem");

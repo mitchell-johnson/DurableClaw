@@ -59,6 +59,16 @@ Send:
 
 The complete frame vocabulary lives in `src/agent-core/protocol.ts` and `src/hooks/useAgentChat.ts`.
 
+### Background research replies and messaging bridges
+
+`spawn_subagents` returns before the research finishes. Its initial `assistant_end` ends the acknowledgement, not the research. Keep the conversation connection open for the later reply. When every task has settled (including failures and timeouts), the coordinator stores one combined answer and emits `assistant_start`, `assistant_delta`, and `assistant_end` for it. This reply has its own `request_id` (the batch ID), a stable `message_id`, and the original `parent_request_id`. Do not discard it just because the original request has finished.
+
+For complete-message clients, an `assistant_message` with the same `message_id` follows the reply lifecycle. Upsert/deduplicate by `message_id` across these frames; they represent one reply, not two. `subagent_batch: completed` means the answer is stored and live delivery was attempted. It is not confirmation of receipt by WhatsApp or any other external service.
+
+A messaging bridge must keep the conversation-to-recipient mapping after the acknowledgement, consume later replies, and persist delivered message IDs. On reconnect, process unseen assistant messages from history before `ready`, or recover them through the paginated messages endpoint, then continue consuming live frames. Mark delivery only after the external service accepts the message. Retain pending sends for retry on bridge restart. A bridge supporting both streamed and complete replies must deduplicate by `message_id`. A WebSocket broadcast alone provides no external delivery acknowledgement or exactly-once guarantee.
+
+The WhatsApp module in `src/channels/whatsapp.ts` remains an unconnected prototype. A separately deployed bridge must implement this contract; the repository cannot verify that bridge's delivery or credentials.
+
 ## Persona and MCP
 
 A partial persona update may contain `identity_override`, `persona`, `enabled_tools`, `disabled_tools`, `reasoning_effort`, `memory_enabled`, `memory_settings`, `wake_interval_minutes`, `dream_interval_hours`, and `mcp_servers`. A denylist takes precedence. Response depth is `fast`, `thorough`, or null.

@@ -4843,6 +4843,46 @@ CREATE TABLE IF NOT EXISTS context (
     const batch = this.getBatchRecord(batchId);
     if (batch) this.emitBatchStatus(batch, status);
   }
+  private sendSubagentReply(
+    conversationId: string,
+    batchId: string,
+    parentRequestId: string | null | undefined,
+    messageId: string,
+    content: string,
+  ): void {
+    // The dispatch acknowledgement has already ended. Reusing its request ID
+    // makes request-scoped clients discard the later answer. Channel bridges
+    // also need the normal reply lifecycle; assistant_message alone is often
+    // consumed only as history. Persist before calling this method so replay
+    // can recover an answer when the socket is disconnected.
+    const identity = {
+      request_id: batchId,
+      parent_request_id: parentRequestId ?? undefined,
+      message_id: messageId,
+      batch_id: batchId,
+    };
+    this.sendToConversation(conversationId, {
+      type: "assistant_start",
+      ...identity,
+    });
+    this.sendToConversation(conversationId, {
+      type: "assistant_delta",
+      ...identity,
+      content,
+    });
+    this.sendToConversation(conversationId, {
+      type: "assistant_end",
+      ...identity,
+    });
+    // Keep complete-message consumers compatible. A browser waiting for a
+    // different foreground request ignores the lifecycle above but can still
+    // upsert this independent result by its durable message ID.
+    this.sendToConversation(conversationId, {
+      type: "assistant_message",
+      ...identity,
+      content,
+    });
+  }
   private async failSubagentBatch(batchId: string): Promise<void> {
     const batch = this.getBatchRecord(batchId);
     if (!batch || batch.status === "synthesizing") return;
@@ -4873,12 +4913,13 @@ CREATE TABLE IF NOT EXISTS context (
           .toArray()[0]
       : undefined;
     if (delivered && batch.conversation_id) {
-      this.sendToConversation(batch.conversation_id, {
-        type: "assistant_message",
-        content: delivered.content,
-        message_id: `batch_${batchId}`,
-        request_id: batch.request_id,
-      });
+      this.sendSubagentReply(
+        batch.conversation_id,
+        batchId,
+        batch.request_id,
+        `batch_${batchId}`,
+        String(delivered.content),
+      );
       this.finishSubagentBatch(batchId, "completed");
       return;
     }
@@ -4894,12 +4935,13 @@ CREATE TABLE IF NOT EXISTS context (
         content,
         messageId: `batch_${batchId}`,
       });
-      this.sendToConversation(batch.conversation_id, {
-        type: "assistant_message",
+      this.sendSubagentReply(
+        batch.conversation_id,
+        batchId,
+        batch.request_id,
+        messageId,
         content,
-        message_id: messageId,
-        request_id: batch.request_id,
-      });
+      );
     }
     if (batch.origin === "wake") {
       const run = findWakeRunByBatchId(this.sql, batchId);
@@ -5396,12 +5438,13 @@ CREATE TABLE IF NOT EXISTS context (
         content,
         messageId: `batch_${batch_id}`,
       });
-      this.sendToConversation(conversationId, {
-        type: "assistant_message",
+      this.sendSubagentReply(
+        conversationId,
+        batch_id,
+        batch?.request_id,
+        messageId,
         content,
-        message_id: messageId,
-        request_id: batch?.request_id,
-      });
+      );
     }
     logInfo("DurableClaw subagent batch synthesized", {
       "do.name": "NanoChatAgent",
