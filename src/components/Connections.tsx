@@ -129,7 +129,7 @@ export function Connections({
     });
   };
   return (
-    <section className="settings-page connections-page">
+    <section className="connections-section" aria-label="Messaging and devices">
       <div className="button-row">
         <button disabled={busy} onClick={() => void action(load)}>
           Refresh connections

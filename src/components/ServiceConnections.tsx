@@ -277,10 +277,7 @@ export function ServiceConnections({ api }: { api: Api }) {
       connection.status === "reauth_required",
   );
   return (
-    <section
-      className="settings-page connections-page"
-      aria-label="External services"
-    >
+    <section className="connections-section" aria-label="External services">
       <h3>External services</h3>
       <p>
         Enable read and write access for the selected Google services from the

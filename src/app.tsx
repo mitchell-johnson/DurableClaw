@@ -660,10 +660,10 @@ function Workspace({
             onSignInAgain={signOut}
           />
         ) : tab === "connections" ? (
-          <>
+          <div className="settings-page connections-page">
             <ServiceConnections api={api} />
             <Connections api={api} conversationId={chat.conversationId} />
-          </>
+          </div>
         ) : tab === "memory" ? (
           <Memories api={api} />
         ) : (

@@ -439,6 +439,11 @@ details summary {
   min-height: 0;
   overscroll-behavior: contain;
 }
+.connections-section + .connections-section {
+  margin-top: 2rem;
+  padding-top: 1.5rem;
+  border-top: 1px solid #344651;
+}
 .connections-page pre,
 .connections-page code {
   overflow-wrap: anywhere;
