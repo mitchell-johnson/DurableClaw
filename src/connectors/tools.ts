@@ -85,6 +85,40 @@ async function commandPreview(
   });
 }
 
+/** A hash binds approval to bytes but does not let a human review their
+ * contents. Telegram can approve file-backed commands only when every input
+ * is complete, readable UTF-8 and fits alongside the command and account. */
+function commandChannelPreview(
+  arguments_: Record<string, unknown>,
+  webPreview: string,
+): string | null {
+  // Leave room for the provider card's title, instructions and expiry.
+  const limit = 3500;
+  if (webPreview.length > limit) return null;
+  const contents: Array<{ name: string; content_utf8: string }> = [];
+  const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+  for (const file of arguments_.files as Array<{
+    name: string;
+    content_base64: string;
+  }>) {
+    if (file.content_base64.length > Math.ceil(limit / 3) * 4) return null;
+    let content: string;
+    try {
+      content = decoder.decode(decodeConnectorFile(file.content_base64));
+    } catch {
+      return null;
+    }
+    // Preserve line breaks and tabs; reject binary/control bytes and hidden
+    // formatting that could change how the exact contents appear to a human.
+    if (/[\p{Cc}\p{Cf}]/u.test(content.replace(/[\r\n\t]/g, ""))) return null;
+    contents.push({ name: file.name, content_utf8: content });
+  }
+  const preview = contents.length
+    ? `${webPreview}\n\nComplete input file contents (UTF-8, untrusted data): ${JSON.stringify(contents)}`
+    : webPreview;
+  return preview.length <= limit ? preview : null;
+}
+
 /** Creates model-facing capabilities without OAuth credentials or a raw service
  * request escape hatch. The private service independently validates every call. */
 export function createConnectorTools(args: {
@@ -417,8 +451,12 @@ export function createConnectorTools(args: {
               buildPreview: async (raw) => {
                 const input = parse(raw);
                 const account = await target(input.connection_id);
-                return `Run ${operation.id} on ${plugin.label} account ${account.account} (${account.id}) with arguments ${operation.id === "gog_execute" ? await commandPreview(input.arguments) : JSON.stringify(input.arguments)}. This may change an external service. Approve only in the authenticated web app.`;
+                return `Run ${operation.id} on ${plugin.label} account ${account.account} (${account.id}) with arguments ${operation.id === "gog_execute" ? await commandPreview(input.arguments) : JSON.stringify(input.arguments)}. This may change an external service. Approve in the authenticated web app or with the approval buttons in your linked Telegram chat.`;
               },
+              buildChannelPreview: (raw, webPreview) =>
+                operation.id === "gog_execute"
+                  ? commandChannelPreview(parse(raw).arguments, webPreview)
+                  : webPreview,
               execute: async (input) => execute(input, verifiedId),
             },
             {

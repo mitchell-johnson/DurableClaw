@@ -2,7 +2,7 @@
 
 Google Workspace runs in the cloud while Macs are offline. In **Connections → External services**, select the Google services to authorize, choose **Connect Google Workspace**, and complete the consent popup. Gmail is selected initially. The integration supports gogcli's Google API read/write command surface through a generated catalog, including sending, drafts, labels, calendar changes, document editing and file transfers.
 
-Every generic gogcli command requires exact approval in the web app. The three separately audited Gmail search/message/thread tools can read directly under the connected account's grant. A Google grant does not replace DurableClaw's action approval, and email or document content cannot approve an action.
+Every generic gogcli command requires exact approval in the web app or through the approval buttons in the owner's linked Telegram chat. The three separately audited Gmail search/message/thread tools can read directly under the connected account's grant. A Google grant does not replace DurableClaw's action approval, and email or document content cannot approve an action.
 
 ## Runtime choice
 
@@ -75,14 +75,14 @@ Users explicitly select Maps while connecting their Google account; Maps adds no
 
 ## Tools and command compatibility
 
-| Tool                                     | Purpose                                                                                            |
-| ---------------------------------------- | -------------------------------------------------------------------------------------------------- |
-| `list_service_connections`               | Account metadata, authorized services and connection IDs                                           |
-| `gog_describe`                           | Paginated command discovery; use `service` or an exact dotted `command`                            |
-| `gog_execute`                            | A canonical command with typed `positionals`, named `flags`, optional files and exact web approval |
-| `get_service_invocation`                 | Recover the status/result of a known invocation without executing it again                         |
-| `gmail_search`                           | Up to 50 message summaries, default 10                                                             |
-| `gmail_get_message` / `gmail_get_thread` | Bounded, sanitized reads by Gmail ID                                                               |
+| Tool                                     | Purpose                                                                                              |
+| ---------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `list_service_connections`               | Account metadata, authorized services and connection IDs                                             |
+| `gog_describe`                           | Paginated command discovery; use `service` or an exact dotted `command`                              |
+| `gog_execute`                            | A canonical command with typed `positionals`, named `flags`, optional files and exact owner approval |
+| `get_service_invocation`                 | Recover the status/result of a known invocation without executing it again                           |
+| `gmail_search`                           | Up to 50 message summaries, default 10                                                               |
+| `gmail_get_message` / `gmail_get_thread` | Bounded, sanitized reads by Gmail ID                                                                 |
 
 Example tool arguments for a send proposal:
 
@@ -94,19 +94,19 @@ Example tool arguments for a send proposal:
     "flags": {
       "to": "recipient@example.com",
       "subject": "Review required",
-      "body": "This message will be sent only after web approval."
+      "body": "This message will be sent only after your approval."
     }
   }
 }
 ```
 
-This first call creates a pending preview. The model cannot approve it. After the owner approves through the normal confirmation UI, a matching tool call may consume that approval once. Generic reads also use this gate; conservative classification avoids mistaking a mutation for a safe read.
+This first call creates a pending preview. The model cannot approve it. After the owner approves through the web confirmation UI or the buttons in their linked Telegram chat, a matching tool call may consume that approval once. Telegram approvals are bound to the linked owner, chat, conversation and exact request; a plain-text reply cannot approve an action. Generic reads also use this gate; conservative classification avoids mistaking a mutation for a safe read.
 
 The fork's native Cloudflare port implements 542 canonical Google API commands from the pinned upstream revision. The catalog retains command paths, typed arguments and documented file capabilities from gogcli's own command tree. Supply the canonical dotted path shown by `gog_describe`; CLI shell aliases are not parsed. Flags and positionals are validated before execution. Unknown fields, root credential/runtime flags, shell hooks, browser launches, listeners, credential/config management and deployment helpers are excluded from this cloud API interface. This preserves Google API operations while keeping local gogcli runtime administration out of an agent's service call.
 
-Local image insertion follows gogcli’s Drive upload flow: Google requires a fetchable image URL, so uploaded image files receive anyone-with-the-link read permission. The web approval preview discloses that effect for local image commands. An invocation uploads at most eight images. The port revokes temporary Docs image permissions and deletes temporary Slides images on success and normal errors. Failed cleanup records safe file IDs and whether public read permission may remain; inspect these through `get_service_invocation`, then use a separately approved Drive command to recover. These diagnostics survive ordinary result eviction. The invocation stays `unknown` and cannot automatically retry. Abrupt termination can prevent diagnostics from being recorded, so also inspect recent Drive uploads after an interrupted image operation. Use existing approved image URLs when that sharing is unsuitable.
+Local image insertion follows gogcli’s Drive upload flow: Google requires a fetchable image URL, so uploaded image files receive anyone-with-the-link read permission. The approval preview discloses that effect for local image commands. An invocation uploads at most eight images. The port revokes temporary Docs image permissions and deletes temporary Slides images on success and normal errors. Failed cleanup records safe file IDs and whether public read permission may remain; inspect these through `get_service_invocation`, then use a separately approved Drive command to recover. These diagnostics survive ordinary result eviction. The invocation stays `unknown` and cannot automatically retry. Abrupt termination can prevent diagnostics from being recorded, so also inspect recent Drive uploads after an interrupted image operation. Use existing approved image URLs when that sharing is unsuitable.
 
-Google authorization still applies to every command. Users select service bundles; the server derives their scopes from the pinned manifest and reviewed write-scope additions. Full Gmail support includes the permanent-deletion scope. Workspace administration requires appropriate domain privileges. Calendar directory lookup and People directory search also require the Contacts selection; Calendar team availability requires Groups; Gmail contact-name search requires Contacts. The Sheets grant includes BigQuery read access for Connected Sheets; data-source operations also require an authorized billing project and BigQuery IAM permissions. Keep needs Workspace delegation, Maps needs an API key, and Zoom uses separate provider authorization; a Google consumer OAuth grant cannot substitute for those credential models. Google Photos also limits operations to content allowed by its current API. These requirements are distinct from command discovery and web approval.
+Google authorization still applies to every command. Users select service bundles; the server derives their scopes from the pinned manifest and reviewed write-scope additions. Full Gmail support includes the permanent-deletion scope. Workspace administration requires appropriate domain privileges. Calendar directory lookup and People directory search also require the Contacts selection; Calendar team availability requires Groups; Gmail contact-name search requires Contacts. The Sheets grant includes BigQuery read access for Connected Sheets; data-source operations also require an authorized billing project and BigQuery IAM permissions. Keep needs Workspace delegation, Maps needs an API key, and Zoom uses separate provider authorization; a Google consumer OAuth grant cannot substitute for those credential models. Google Photos also limits operations to content allowed by its current API. These requirements are distinct from command discovery and action approval.
 
 File capabilities use `input:NAME` and `output:NAME` values in the command's documented file arguments. Supply input contents as `files: [{name, content_base64}]` and declare `output_files: [NAME]`. Filenames cannot name host paths. Commands use an invocation-local in-memory file map; output files become private R2 artifacts, and tool results contain authenticated download paths rather than base64. Resource limits apply: at most eight input files and output declarations, up to 32 returned artifacts, 4 MiB aggregate decoded file data, bounded JSON/command output and a 30-second command deadline and 100 Google HTTP requests per invocation. Inspect `gog_describe` for each command's exact schema and restrictions. Polling commands return a bounded snapshot and continuation/state artifact, which can be supplied to a later approved invocation. Terminal formatting, OS credential management, local listener processes, tracking-server setup and separate Zoom authorization are outside the Google API port. Markdown and document transformations execute locally inside the DO; they do not send private content to a rendering service.
 
@@ -128,7 +128,7 @@ Preserve `CONNECTOR_CREDENTIALS_SECRET` in a secret manager. Replacing it withou
 
 Implement a trusted `ServiceConnectorPlugin` in `src/connectors/` and register it in `connectorRegistry`. Declare unique provider/operation IDs, a version, closed input schemas, strict runtime parsing and read/write effects. Implement the matching `ServiceProvider` in `services/connectors/src/providers.ts`, with fixed OAuth settings, scopes, account identity parsing and a bounded execution transport. The vault executes the native command implementation in-process or calls a trusted provider at its fixed HTTPS API origin. Register both deployments and add an exact OAuth destination to the provider's UI flow.
 
-Write operations must use the existing server-issued, conversation-bound, argument-bound web approvals. Bind execution to an immutable connection identity and bump the manifest version when changing semantics. No plugin receives a raw HTTP or credential-management escape hatch. Untrusted uploaded connector code requires a separate isolation design, such as Workers for Platforms, with narrow brokered capabilities.
+Write operations must use the existing server-issued, conversation-bound, argument-bound owner approvals. Bind execution to an immutable connection identity and bump the manifest version when changing semantics. No plugin receives a raw HTTP or credential-management escape hatch. Untrusted uploaded connector code requires a separate isolation design, such as Workers for Platforms, with narrow brokered capabilities.
 
 ## Checks
 

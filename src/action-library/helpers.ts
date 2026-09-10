@@ -94,7 +94,7 @@ export interface ConfirmToolOptions {
  * one returns a preview plus a SERVER-ISSUED `confirmation_id` recorded in
  * the owning DO's storage; execution requires that record to exist, match
  * this tool name AND these exact arguments, be unexpired, unconsumed and —
- * Stage B — approved through the session-bound decision endpoint. Any
+ * Stage B — approved through an authenticated web or messaging decision. Any
  * mismatch re-runs the preview phase; it never executes.
  *
  * `confirm_args` is gone entirely: pre-satisfied arguments must never reach
@@ -108,6 +108,11 @@ export function defineConfirmTool<T extends Record<string, unknown>>(
     properties: Record<string, object>;
     required?: string[];
     buildPreview: (input: T) => string | Promise<string>;
+    /** Complete human-readable channel review; null keeps approval in the web app. */
+    buildChannelPreview?: (
+      input: T,
+      webPreview: string,
+    ) => string | null | Promise<string | null>;
     execute: (input: T) => Promise<string>;
   },
   options?: ConfirmToolOptions,
@@ -162,12 +167,16 @@ export function defineConfirmTool<T extends Record<string, unknown>>(
         // Fail closed: issue a FRESH pending record so the human approval
         // path stays reachable, but never fall through to execute on a
         // mismatched, expired, unapproved or spent id.
+        const preview = await config.buildPreview(input);
+        const channelPreview = config.buildChannelPreview
+          ? await config.buildChannelPreview(input, preview)
+          : preview;
         const issuedId = await coordinator.issue({
           conversationId,
           toolName,
           argsHash,
+          preview: channelPreview ?? undefined,
         });
-        const preview = await config.buildPreview(input);
         return JSON.stringify({
           needs_confirmation: true,
           preview,

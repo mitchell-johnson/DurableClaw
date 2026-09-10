@@ -98,6 +98,8 @@ export function createWorkspaceTools(args: {
         required: ["path", "content"],
         buildPreview: (i) =>
           `Write ${new TextEncoder().encode(i.content).length} bytes to ${safePath(i.path)}`,
+        buildChannelPreview: (i, preview) =>
+          `${preview}\n\nComplete file contents (JSON string):\n${JSON.stringify(i.content)}`,
         execute: async (i) => {
           await mutation();
           const path = safePath(i.path);

@@ -111,7 +111,9 @@ async function routeRequest(request: Request, env: Env): Promise<Response> {
         if (principal.role !== "owner") throw new Error("Owner required");
         const stub = await ownerStub(env, principal);
         const response = await stub.fetch(
-          "https://agent.internal/channel-message",
+          message.approval
+            ? "https://agent.internal/channel-decision"
+            : "https://agent.internal/channel-message",
           {
             method: "POST",
             headers: await signedHeaders(principal, env),
@@ -120,8 +122,14 @@ async function routeRequest(request: Request, env: Env): Promise<Response> {
           },
         );
         if (!response.ok) throw new Error("Channel turn unavailable");
-        const reply = await response.json<{ text: string }>();
-        await authorizePrincipal(env, owner.userId, owner.workspaceId);
+        const reply =
+          await response.json<import("./channels/plugin").MessagingReply>();
+        const current = await authorizePrincipal(
+          env,
+          owner.userId,
+          owner.workspaceId,
+        );
+        if (current.role !== "owner") throw new Error("Owner required");
         return reply;
       });
     }

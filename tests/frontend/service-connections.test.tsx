@@ -221,7 +221,9 @@ describe("external service connections", () => {
       screen.getByText(/Review the selected permissions in Google/),
     ).toBeTruthy();
     expect(
-      screen.getByText(/require your approval in this web app/),
+      screen.getByText(
+        /require your approval here or with the buttons in your linked Telegram chat/,
+      ),
     ).toBeTruthy();
     expect(
       screen.queryByText(/read.only|Sending mail is not enabled/i),

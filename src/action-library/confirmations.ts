@@ -5,8 +5,8 @@
  * The preview phase returns a SERVER-ISSUED `confirmation_id`; execution is
  * only possible when the owning Durable Object's storage holds a matching,
  * unexpired, unconsumed record for that id — and (Stage B) one whose status
- * has been flipped to `approved` by the session-bound HTTP decision endpoint,
- * the only transport that can approve.
+ * has been flipped to `approved` by an authenticated web decision or a
+ * verified, single-use approval button in the owner's linked messaging chat.
  *
  * This module defines the narrow interface the generic tool layer needs plus
  * the canonical argument hashing every phase agrees on. The SQLite
@@ -56,6 +56,8 @@ export interface ConfirmationIssueArgs {
   conversationId: string;
   toolName: string;
   argsHash: string;
+  /** Trusted tool-generated review, captured before its id reaches the model. */
+  preview?: string;
 }
 
 export interface ConfirmationVerifyArgs extends ConfirmationIssueArgs {

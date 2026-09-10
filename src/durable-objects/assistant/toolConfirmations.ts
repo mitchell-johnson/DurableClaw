@@ -6,8 +6,8 @@
  * confirmation state survives hibernation and is judged server-side only.
  *
  * Lifecycle: `issue` (preview phase) inserts a `pending` row carrying the
- * tool name and the canonical-args hash; only the session-bound HTTP decision
- * endpoint may flip it `pending -> approved` (CAS); `consume` wins exactly
+ * tool name and the canonical-args hash; authenticated web or linked messaging
+ * decisions may flip it `pending -> approved` (CAS); `consume` wins exactly
  * once per record via a guarded UPDATE, so a single approval can power at
  * most one execution. Any mismatch — wrong tool, different arguments, an
  * expired or already-consumed record, or a status that is not `approved` —
@@ -47,6 +47,54 @@ CREATE INDEX IF NOT EXISTS idx_confirmations_expiry ON tool_confirmations(expire
 /** Idempotent DDL, run by the DO's schema migration to v7. */
 export function ensureToolConfirmationsSchema(sql: SqlLike): void {
   sql.exec(SCHEMA_SQL);
+  ensureToolConfirmationReviews(sql);
+}
+
+/** Additive companion table; existing confirmations keep their original state. */
+export function ensureToolConfirmationReviews(sql: SqlLike): void {
+  sql.exec(`CREATE TABLE IF NOT EXISTS tool_confirmation_reviews (
+    confirmation_id TEXT PRIMARY KEY, preview TEXT NOT NULL
+  )`);
+}
+
+/** Clearing history also revokes its approvals and removes private previews. */
+export function deleteConversationConfirmations(
+  sql: SqlLike,
+  conversationId: string,
+): void {
+  sql.exec(
+    "DELETE FROM tool_confirmation_reviews WHERE confirmation_id IN (SELECT confirmation_id FROM tool_confirmations WHERE conversation_id=?)",
+    conversationId,
+  );
+  sql.exec(
+    "DELETE FROM tool_confirmations WHERE conversation_id=?",
+    conversationId,
+  );
+}
+
+export interface ToolConfirmationReview {
+  confirmationId: string;
+  toolName: string;
+  preview: string;
+  expiresAt: number;
+}
+
+export function pendingToolConfirmationReviews(
+  sql: SqlLike,
+  conversationId: string,
+  now = Date.now(),
+): ToolConfirmationReview[] {
+  return sql
+    .exec(
+      `SELECT c.confirmation_id AS confirmationId, c.tool_name AS toolName,
+      r.preview, c.expires_at AS expiresAt
+     FROM tool_confirmations c JOIN tool_confirmation_reviews r USING(confirmation_id)
+     WHERE c.conversation_id=? AND c.status='pending' AND c.consumed_at IS NULL AND c.expires_at>?
+     ORDER BY c.created_at, c.confirmation_id LIMIT 10`,
+      conversationId,
+      now,
+    )
+    .toArray() as unknown as ToolConfirmationReview[];
 }
 
 interface ConfirmationRow {
@@ -82,6 +130,10 @@ export function issueToolConfirmation(
   now: number,
 ): string {
   sweepExpired(sql, now);
+  ensureToolConfirmationReviews(sql);
+  sql.exec(
+    "DELETE FROM tool_confirmation_reviews WHERE confirmation_id NOT IN (SELECT confirmation_id FROM tool_confirmations)",
+  );
   const confirmationId = crypto.randomUUID();
   sql.exec(
     `INSERT INTO tool_confirmations
@@ -94,14 +146,26 @@ export function issueToolConfirmation(
     now,
     now + CONFIRMATION_TTL_MS,
   );
+  // Overlong or missing reviews stay available in the web transcript. Never
+  // silently truncate an action and make the shortened version approvable.
+  if (
+    typeof args.preview === "string" &&
+    args.preview.trim() &&
+    args.preview.length <= 20000
+  )
+    sql.exec(
+      "INSERT INTO tool_confirmation_reviews (confirmation_id,preview) VALUES (?,?)",
+      confirmationId,
+      args.preview,
+    );
   return confirmationId;
 }
 
 /**
  * CAS `pending -> approved`. Returns false when the record was already
  * decided (approved/declined), expired, or never existed. This is the ONLY
- * path to `approved`, and it is reachable exclusively from the DO's decision
- * endpoint behind the session-authenticated route.
+ * path to `approved`, called only after authenticating a web session or a
+ * provider callback bound to the current owner's linked chat and exact prompt.
  */
 export function decideToolConfirmation(
   sql: SqlLike,

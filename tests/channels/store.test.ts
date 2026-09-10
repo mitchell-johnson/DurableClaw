@@ -7,6 +7,7 @@ import type { AgentPrincipal } from "../../src/types";
 import type {
   MessagingEnv,
   MessagingEvent,
+  MessagingApprovalEvent,
   MessagingPlugin,
 } from "../../src/channels";
 
@@ -23,6 +24,12 @@ function fixture() {
   sqlite.exec(
     readFileSync(
       new URL("../../migrations/0002_messaging.sql", import.meta.url),
+      "utf8",
+    ),
+  );
+  sqlite.exec(
+    readFileSync(
+      new URL("../../migrations/0004_messaging_approvals.sql", import.meta.url),
       "utf8",
     ),
   );
@@ -106,7 +113,7 @@ const event = (overrides: Partial<MessagingEvent> = {}): MessagingEvent => ({
   content: "hello",
   ...overrides,
 });
-const webhook = (data: MessagingEvent) =>
+const webhook = (data: MessagingEvent | MessagingApprovalEvent) =>
   new Request("https://claw.test/api/messaging/webhooks/example", {
     method: "POST",
     headers: { "test-auth": "provider-secret" },
@@ -144,6 +151,45 @@ async function link(
 }
 
 describe("shared messaging authorization and delivery", () => {
+  it("delivers pending exact actions through optional plugin approval cards", async () => {
+    const f = fixture();
+    await link(f);
+    f.plugin.sendApproval = vi.fn(async () => ({ messageId: "99" }));
+    const callback = vi.fn(async () => ({
+      text: "Review the pending email.",
+      approvals: [
+        {
+          confirmationId: "confirm_1",
+          toolName: "gmail_send",
+          preview: "To: alice@example.test\nBody: Exact body",
+          expiresAt: Date.now() + 600000,
+        },
+      ],
+    }));
+    await channels.handleMessagingWebhook(
+      webhook(event({ eventId: "2" })),
+      f.env,
+      callback,
+      f.registry,
+    );
+    expect(f.plugin.sendApproval).toHaveBeenCalledExactlyOnceWith(
+      f.env,
+      expect.objectContaining({
+        chatId: "private-chat",
+        text: expect.stringContaining("Body: Exact body"),
+        approveData: expect.stringMatching(/^dc:a:[A-Za-z0-9_-]{32}$/),
+        declineData: expect.stringMatching(/^dc:d:[A-Za-z0-9_-]{32}$/),
+      }),
+    );
+    expect(callback.mock.calls[0][1]).toMatchObject({
+      channel: {
+        pluginId: "example",
+        senderId: "sender",
+        chatId: "private-chat",
+        linkId: expect.any(String),
+      },
+    });
+  });
   async function linkedWork(f: ReturnType<typeof fixture>) {
     await link(f);
     const callback = dispatch();
@@ -730,5 +776,451 @@ describe("shared messaging authorization and delivery", () => {
     expect(() =>
       channels.createMessagingRegistry([{ ...f.plugin, id: "../invalid" }]),
     ).toThrow();
+  });
+});
+
+describe("messaging approval authority and durable claims", () => {
+  async function approvalsFixture() {
+    const f = fixture();
+    await link(f);
+    const approval = {
+      confirmationId: "confirmation_1",
+      toolName: "gmail_send",
+      preview:
+        "To: alice@example.test\nSubject: Test\nBody: complete exact content",
+      expiresAt: Date.now() + 600000,
+    };
+    f.plugin.sendApproval = vi.fn(async () => ({ messageId: "99" }));
+    f.plugin.answerCallback = vi.fn(async () => {});
+    f.plugin.clearApproval = vi.fn(async () => {});
+    const ask = (eventId = "request") =>
+      channels.handleMessagingWebhook(
+        webhook(event({ eventId })),
+        f.env,
+        vi.fn(async () => ({ text: "Please review", approvals: [approval] })),
+        f.registry,
+      );
+    const button = (
+      overrides: Partial<MessagingApprovalEvent> = {},
+    ): MessagingApprovalEvent => ({
+      kind: "approval",
+      eventId: "button",
+      senderId: "sender",
+      chatId: "private-chat",
+      callbackId: "callback",
+      messageId: "99",
+      occurredAt: Date.now(),
+      data: vi.mocked(f.plugin.sendApproval!).mock.calls[0][1].approveData,
+      ...overrides,
+    });
+    const press = (data = button(), callback = dispatch()) =>
+      channels.handleMessagingWebhook(
+        webhook(data),
+        f.env,
+        callback,
+        f.registry,
+      );
+    return { ...f, approval, ask, button, press };
+  }
+
+  it.each(["confirmed", "declined"] as const)(
+    "dispatches a %s button only through structured approval input",
+    async (decision) => {
+      const f = await approvalsFixture();
+      await f.ask();
+      const callback = dispatch();
+      const data = f.button();
+      if (decision === "declined")
+        data.data = data.data.replace("dc:a:", "dc:d:");
+      expect((await f.press(data, callback)).status).toBe(200);
+      expect(callback).toHaveBeenCalledExactlyOnceWith(owner, {
+        conversationId: "conversation",
+        requestId: expect.stringMatching(/^approval_[a-f0-9]{64}$/),
+        content: "Approval button selected.",
+        channel: {
+          linkId: expect.any(String),
+          pluginId: "example",
+          senderId: "sender",
+          chatId: "private-chat",
+        },
+        approval: { confirmationId: "confirmation_1", decision },
+      });
+      expect(f.plugin.answerCallback).toHaveBeenCalledExactlyOnceWith(f.env, {
+        callbackId: "callback",
+        text: "Decision received.",
+      });
+      expect(f.plugin.clearApproval).toHaveBeenCalledExactlyOnceWith(f.env, {
+        chatId: "private-chat",
+        messageId: "99",
+      });
+      expect(
+        f.sqlite
+          .prepare("SELECT status,decision FROM messaging_approvals")
+          .get(),
+      ).toEqual({ status: "consumed", decision });
+      expect(f.sent.at(-1)?.text).toBe("Agent reply");
+    },
+  );
+
+  it("stores only token hashes and scoped identifiers, with a bounded expiry", async () => {
+    const f = await approvalsFixture();
+    f.approval.expiresAt = Date.now() + 3600000;
+    await f.ask();
+    const card = vi.mocked(f.plugin.sendApproval!).mock.calls[0][1];
+    const row = f.sqlite
+      .prepare("SELECT * FROM messaging_approvals")
+      .get() as Record<string, unknown>;
+    expect(row.token_hash).toMatch(/^[a-f0-9]{64}$/);
+    expect(JSON.stringify(row)).not.toContain(card.approveData.slice(5));
+    expect(JSON.stringify(row)).not.toContain("alice@example.test");
+    expect(JSON.stringify(row)).not.toContain("complete exact content");
+    expect(Number(row.expires_at) - Number(row.created_at)).toBe(600000);
+    expect(row).toMatchObject({
+      user_id: "alice",
+      workspace_id: "workspace",
+      plugin_id: "example",
+      conversation_id: "conversation",
+      sender_id: "sender",
+      chat_id: "private-chat",
+      message_id: "99",
+      status: "sent",
+    });
+    expect(
+      new TextEncoder().encode(card.approveData).length,
+    ).toBeLessThanOrEqual(64);
+  });
+
+  it.each([
+    { senderId: "attacker" },
+    { chatId: "other-chat" },
+    { messageId: "100" },
+    { data: `dc:a:${"z".repeat(32)}` },
+    { callbackId: "x".repeat(129) },
+    { data: "approve" },
+    { messageId: "" },
+    { occurredAt: 0 },
+  ])(
+    "rejects a mismatched or malformed callback %j without consuming it",
+    async (overrides) => {
+      const f = await approvalsFixture();
+      await f.ask();
+      const callback = dispatch();
+      await f.press(f.button(overrides), callback);
+      expect(callback).not.toHaveBeenCalled();
+      expect(
+        f.sqlite.prepare("SELECT status FROM messaging_approvals").get(),
+      ).toEqual({ status: "sent" });
+      await f.press(f.button(), callback);
+      expect(callback).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each([
+    "user_id",
+    "workspace_id",
+    "plugin_id",
+    "sender_id",
+    "chat_id",
+    "conversation_id",
+    "id",
+  ])("rejects changed current link %s authority", async (field) => {
+    const f = await approvalsFixture();
+    await f.ask();
+    f.sqlite.prepare(`UPDATE messaging_links SET ${field}='replacement'`).run();
+    const callback = dispatch();
+    await f.press(f.button(), callback);
+    expect(callback).not.toHaveBeenCalled();
+    expect(
+      f.sqlite.prepare("SELECT status FROM messaging_approvals").get(),
+    ).toEqual({ status: "sent" });
+  });
+
+  it("races opposite decisions and replayed event IDs to a single dispatch", async () => {
+    const f = await approvalsFixture();
+    await f.ask();
+    const callback = dispatch();
+    await Promise.all(
+      Array.from({ length: 12 }, (_, index) =>
+        f.press(
+          f.button({
+            eventId: `button_${index}`,
+            data: f
+              .button()
+              .data.replace("dc:a:", index % 2 ? "dc:d:" : "dc:a:"),
+          }),
+          callback,
+        ),
+      ),
+    );
+    expect(callback).toHaveBeenCalledTimes(1);
+    expect(f.plugin.clearApproval).toHaveBeenCalledTimes(1);
+    expect(
+      f.sqlite
+        .prepare(
+          "SELECT COUNT(*) AS count FROM messaging_deliveries WHERE request_id LIKE 'approval_%'",
+        )
+        .get(),
+    ).toEqual({ count: 1 });
+  });
+
+  it("deduplicates the same pending confirmation across concurrent replies", async () => {
+    const f = await approvalsFixture();
+    await Promise.all(
+      Array.from({ length: 10 }, (_, index) => f.ask(`ask_${index}`)),
+    );
+    expect(f.plugin.sendApproval).toHaveBeenCalledTimes(1);
+    expect(
+      f.sqlite
+        .prepare("SELECT COUNT(*) AS count FROM messaging_approvals")
+        .get(),
+    ).toEqual({ count: 1 });
+  });
+
+  it("rejects a button until its provider message receipt has been persisted", async () => {
+    const f = await approvalsFixture();
+    const callback = dispatch();
+    f.plugin.sendApproval = vi.fn(async (_env, card) => {
+      await f.press(f.button({ data: card.approveData }), callback);
+      expect(callback).not.toHaveBeenCalled();
+      return { messageId: "99" };
+    });
+    await f.ask();
+    await f.press(f.button(), callback);
+    expect(callback).toHaveBeenCalledTimes(1);
+  });
+
+  it("expires tokens without minting replacement prompts for the same confirmation", async () => {
+    const f = await approvalsFixture();
+    await f.ask();
+    f.sqlite.prepare("UPDATE messaging_approvals SET expires_at=0").run();
+    const callback = dispatch();
+    await f.press(f.button(), callback);
+    await f.ask("second_request");
+    expect(callback).not.toHaveBeenCalled();
+    expect(f.plugin.sendApproval).toHaveBeenCalledTimes(1);
+  });
+
+  it("never retries an ambiguous card send or accepts buttons from that send", async () => {
+    const f = await approvalsFixture();
+    f.plugin.sendApproval = vi.fn(async () => {
+      throw new Error("provider secret and content");
+    });
+    await f.ask();
+    await f.ask("second_request");
+    const callback = dispatch();
+    await f.press(f.button(), callback);
+    expect(callback).not.toHaveBeenCalled();
+    expect(f.plugin.sendApproval).toHaveBeenCalledTimes(1);
+    expect(
+      f.sqlite.prepare("SELECT status FROM messaging_approvals").get(),
+    ).toEqual({ status: "send_unknown" });
+    expect(JSON.stringify(f.sent)).not.toContain("provider secret");
+    expect(
+      f.sent.some((reply) =>
+        reply.text.includes("Open DurableClaw to review its complete details"),
+      ),
+    ).toBe(true);
+  });
+
+  it("never retries an ambiguous approval dispatch, even with a different decision", async () => {
+    const f = await approvalsFixture();
+    await f.ask();
+    const callback = vi.fn(async () => {
+      throw new Error("dispatch lost");
+    });
+    await f.press(f.button(), callback);
+    await f.press(
+      f.button({
+        eventId: "retry",
+        data: f.button().data.replace("dc:a:", "dc:d:"),
+      }),
+      callback,
+    );
+    expect(callback).toHaveBeenCalledTimes(1);
+    expect(
+      f.sqlite
+        .prepare(
+          "SELECT status FROM messaging_deliveries WHERE request_id LIKE 'approval_%'",
+        )
+        .get(),
+    ).toEqual({ status: "dispatch_unknown" });
+  });
+
+  it("sends fresh approval cards returned by a structured decision", async () => {
+    const f = await approvalsFixture();
+    await f.ask();
+    await f.press(
+      f.button(),
+      vi.fn(async () => ({
+        text: "Review next action",
+        approvals: [{ ...f.approval, confirmationId: "confirmation_2" }],
+      })),
+    );
+    expect(f.plugin.sendApproval).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["no-capability", "oversized", "expired", "invalid"])(
+    "uses a web fallback with no buttons for %s previews",
+    async (scenario) => {
+      const f = await approvalsFixture();
+      const sendApproval = f.plugin.sendApproval;
+      if (scenario === "no-capability") delete f.plugin.sendApproval;
+      if (scenario === "oversized") f.approval.preview = "x".repeat(4096);
+      if (scenario === "expired") f.approval.expiresAt = 0;
+      if (scenario === "invalid") f.approval.confirmationId = "../unsafe";
+      await f.ask();
+      expect(sendApproval).not.toHaveBeenCalled();
+      expect(f.sent.at(-1)?.text).toContain(
+        "Open DurableClaw to review its complete details",
+      );
+      expect(
+        f.sqlite
+          .prepare("SELECT COUNT(*) AS count FROM messaging_approvals")
+          .get(),
+      ).toEqual({ count: 0 });
+    },
+  );
+
+  it("treats the word approve as ordinary text regardless of forged approval fields", async () => {
+    const f = await approvalsFixture();
+    await f.ask();
+    const callback = dispatch();
+    await channels.handleMessagingWebhook(
+      webhook({
+        ...event({ eventId: "text", content: "approve" }),
+        approval: { confirmationId: "confirmation_1", decision: "confirmed" },
+        channel: { linkId: "forged" },
+      } as MessagingEvent),
+      f.env,
+      callback,
+      f.registry,
+    );
+    expect(callback.mock.calls[0][1]).toMatchObject({
+      content: "approve",
+      channel: { pluginId: "example" },
+    });
+    expect(callback.mock.calls[0][1]).not.toHaveProperty("approval");
+    expect(callback.mock.calls[0][1].channel.linkId).not.toBe("forged");
+  });
+
+  it("bounds approval retention without evicting fresh ambiguous claims", async () => {
+    const f = await approvalsFixture();
+    await f.ask();
+    for (let index = 1; index < 128; index++) {
+      f.sqlite
+        .prepare(
+          `INSERT INTO messaging_approvals(token_hash,confirmation_id,link_id,user_id,workspace_id,plugin_id,sender_id,chat_id,conversation_id,status,created_at,updated_at,expires_at,retain_until)
+        SELECT ?,?,link_id,user_id,workspace_id,plugin_id,sender_id,chat_id,conversation_id,'send_unknown',created_at,updated_at,expires_at,retain_until FROM messaging_approvals WHERE confirmation_id='confirmation_1'`,
+        )
+        .run(String(index).padStart(64, "0"), `old_${index}`);
+    }
+    f.approval.confirmationId = "next";
+    await f.ask("full");
+    expect(f.plugin.sendApproval).toHaveBeenCalledTimes(1);
+    expect(f.sent.at(-1)?.text).toContain("Open DurableClaw");
+    expect(
+      f.sqlite
+        .prepare("SELECT COUNT(*) AS count FROM messaging_approvals")
+        .get(),
+    ).toEqual({ count: 128 });
+    f.sqlite
+      .prepare(
+        "UPDATE messaging_approvals SET retain_until=0 WHERE confirmation_id='old_1'",
+      )
+      .run();
+    await f.ask("after_expiry");
+    expect(f.plugin.sendApproval).toHaveBeenCalledTimes(2);
+    expect(
+      f.sqlite
+        .prepare("SELECT COUNT(*) AS count FROM messaging_approvals")
+        .get(),
+    ).toEqual({ count: 128 });
+    expect(
+      f.sqlite
+        .prepare(
+          "SELECT COUNT(*) AS count FROM messaging_approvals WHERE status='send_unknown'",
+        )
+        .get(),
+    ).toEqual({ count: 126 });
+  });
+
+  it("bounds cards per reply and directs additional actions to the app", async () => {
+    const f = await approvalsFixture();
+    await channels.handleMessagingWebhook(
+      webhook(event({ eventId: "many" })),
+      f.env,
+      vi.fn(async () => ({
+        text: "Review actions",
+        approvals: Array.from({ length: 10 }, (_, index) => ({
+          ...f.approval,
+          confirmationId: `confirmation_${index}`,
+        })),
+      })),
+      f.registry,
+    );
+    expect(f.plugin.sendApproval).toHaveBeenCalledTimes(8);
+    expect(f.sent.at(-1)?.text).toContain("Open DurableClaw");
+  });
+
+  it("leaves the token available when the delivery retention cap blocks dispatch", async () => {
+    const f = await approvalsFixture();
+    await f.ask();
+    const count = Number(
+      (
+        f.sqlite
+          .prepare("SELECT COUNT(*) AS count FROM messaging_deliveries")
+          .get() as { count: number }
+      ).count,
+    );
+    for (let index = count; index < 1024; index++)
+      f.sqlite
+        .prepare(
+          `INSERT INTO messaging_deliveries(request_id,event_id,link_id,user_id,workspace_id,plugin_id,status,created_at,updated_at,expires_at)
+        SELECT ?,?,link_id,user_id,workspace_id,plugin_id,'sent',created_at,updated_at,expires_at FROM messaging_deliveries LIMIT 1`,
+        )
+        .run(`old_${index}`, `old_${index}`);
+    const callback = dispatch();
+    await f.press(f.button(), callback);
+    expect(callback).not.toHaveBeenCalled();
+    expect(
+      f.sqlite.prepare("SELECT status FROM messaging_approvals").get(),
+    ).toEqual({ status: "sent" });
+    f.sqlite
+      .prepare(
+        "DELETE FROM messaging_deliveries WHERE request_id LIKE 'old_%' LIMIT 1",
+      )
+      .run();
+    await f.press(f.button(), callback);
+    expect(callback).toHaveBeenCalledTimes(1);
+  });
+
+  it("applies the decision even if ephemeral feedback fails and never sends after unlink", async () => {
+    const f = await approvalsFixture();
+    await f.ask();
+    f.plugin.answerCallback = vi.fn(async () => {
+      throw new Error("provider unavailable");
+    });
+    f.plugin.clearApproval = vi.fn(async () => {
+      throw new Error("provider unavailable");
+    });
+    const before = f.sent.length;
+    const callback = vi.fn(async () => {
+      f.sqlite.prepare("DELETE FROM messaging_links").run();
+      return {
+        text: "Private result",
+        approvals: [{ ...f.approval, confirmationId: "next" }],
+      };
+    });
+    await f.press(f.button(), callback);
+    expect(callback).toHaveBeenCalledTimes(1);
+    expect(f.sent).toHaveLength(before);
+    expect(f.plugin.sendApproval).toHaveBeenCalledTimes(1);
+    expect(
+      f.sqlite
+        .prepare(
+          "SELECT status FROM messaging_deliveries WHERE request_id LIKE 'approval_%'",
+        )
+        .get(),
+    ).toEqual({ status: "unlinked" });
   });
 });

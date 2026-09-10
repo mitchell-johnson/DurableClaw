@@ -40,7 +40,7 @@ export function createDeviceTools(args: {
       "run_device_bash",
       {
         description:
-          "Run an exact bash command on a paired device after approval in the authenticated web app. Runs with that macOS user's permissions. Results are asynchronous: inspect get_device_job. Never retry an uncertain execution automatically; request fresh approval if the user explicitly wants another run.",
+          "Run an exact bash command on a paired device after approval in the authenticated web app or with the owner's linked Telegram approval buttons. Runs with that macOS user's permissions. Results are asynchronous: inspect get_device_job. Never retry an uncertain execution automatically; request fresh approval if the user explicitly wants another run.",
         properties: {
           device_id: {
             type: "string",
@@ -67,7 +67,7 @@ export function createDeviceTools(args: {
               item.device_id === command.device_id && item.revoked_at === null,
           );
           if (!device) throw new Error("Device unavailable");
-          return `Run bash on ${device.name} (${device.device_id}) as the installed macOS user.\nWorking directory: ${command.cwd}\nTimeout: ${command.timeout_ms} ms\nCommand:\n${command.command}\nApprove only in the authenticated web app. This permits full access as that user.`;
+          return `Run bash on ${device.name} (${device.device_id}) as the installed macOS user.\nWorking directory: ${command.cwd}\nTimeout: ${command.timeout_ms} ms\nCommand:\n${command.command}\nApprove in the authenticated web app or with the buttons in your linked Telegram chat. This permits full access as that user.`;
         },
         execute: async (input) => {
           if (!consumedApproval || !args.conversationId)

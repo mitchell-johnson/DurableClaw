@@ -6,7 +6,7 @@ All `/api/agent/*`, `/api/events`, `/api/inbox`, `/api/socket-ticket`, and legac
 
 Native installations report `auth_mode:"native"` for verified session cookies and also disable bearer fallback. The closed `/api/auth/*` API supports password/passkey sign-in and authenticated credential management; `/api/auth/access` is the only Access bootstrap entry point. See [native sign-in, enrollment and recovery](native-auth.md). Native WebSockets require both a one-use conversation ticket and a current session cookie; alternate upgrade paths are rejected.
 
-The owner-authenticated [messaging management APIs](messaging.md) and [device management APIs](devices-api.md) are separate from machine ingress. Only provider-authenticated `/api/messaging/webhooks/:plugin` and device enrollment/signature endpoints bypass browser authentication. These endpoints cannot approve tools or select an arbitrary owner. The `run_device_bash` tool queues an exact-argument approved job; `list_devices` and `get_device_job` discover targets and read results.
+The owner-authenticated [messaging management APIs](messaging.md) and [device management APIs](devices-api.md) are separate from machine ingress. Only provider-authenticated `/api/messaging/webhooks/:plugin` and device enrollment/signature endpoints bypass browser authentication. These endpoints cannot select an arbitrary owner. A verified messaging callback can approve only its exact pending action in the current owner’s linked chat; device ingress and ordinary messages cannot approve tools. The `run_device_bash` tool queues an exact-argument approved job; `list_devices` and `get_device_job` discover targets and read results.
 
 ## HTTP endpoints
 

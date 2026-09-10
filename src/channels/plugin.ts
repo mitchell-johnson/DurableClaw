@@ -9,14 +9,45 @@ export interface MessagingEnv {
 export type MessagingCredentials = Omit<MessagingEnv, "CONTROL_DB">;
 
 /** Trusted deployment code must authenticate the provider before returning data.
- * Only private, human-authored text events are supported. Content is never an
- * authorization decision or an action-confirmation response. */
+ * Message content is never an authorization decision. */
 export interface MessagingEvent {
+  kind?: "message";
   eventId: string;
   senderId: string;
   chatId: string;
   content: string;
   occurredAt: number;
+}
+
+/** A provider-authenticated button event, never ordinary model input. */
+export interface MessagingApprovalEvent {
+  kind: "approval";
+  eventId: string;
+  senderId: string;
+  chatId: string;
+  callbackId: string;
+  messageId: string;
+  data: string;
+  occurredAt: number;
+}
+
+export interface MessagingApproval {
+  confirmationId: string;
+  toolName: string;
+  preview: string;
+  expiresAt: number;
+}
+
+export interface MessagingReply {
+  text: string;
+  approvals?: MessagingApproval[];
+}
+
+export interface MessagingChannel {
+  linkId: string;
+  pluginId: string;
+  senderId: string;
+  chatId: string;
 }
 
 export interface MessagingPlugin {
@@ -26,10 +57,28 @@ export interface MessagingPlugin {
   receive(
     request: Request,
     env: MessagingCredentials,
-  ): Promise<MessagingEvent | null>;
+  ): Promise<MessagingEvent | MessagingApprovalEvent | null>;
   send(
     env: MessagingCredentials,
     reply: { chatId: string; text: string },
+  ): Promise<void>;
+  /** Send the complete exact preview. Never truncate approval text. */
+  sendApproval?(
+    env: MessagingCredentials,
+    reply: {
+      chatId: string;
+      text: string;
+      approveData: string;
+      declineData: string;
+    },
+  ): Promise<{ messageId: string }>;
+  answerCallback?(
+    env: MessagingCredentials,
+    reply: { callbackId: string; text: string },
+  ): Promise<void>;
+  clearApproval?(
+    env: MessagingCredentials,
+    target: { chatId: string; messageId: string },
   ): Promise<void>;
   /** Best-effort, ephemeral activity; never sends conversation content. */
   sendTyping?(
@@ -40,11 +89,17 @@ export interface MessagingPlugin {
 }
 
 /** The host must reauthorize the stored owner on each dispatch and execute the
- * request idempotently. This interface deliberately cannot approve tools. */
+ * request idempotently. Only the verified button path may supply approval. */
 export type MessagingDispatch = (
   principal: AgentPrincipal,
-  message: { conversationId: string; requestId: string; content: string },
-) => Promise<{ text: string }>;
+  message: {
+    conversationId: string;
+    requestId: string;
+    content: string;
+    channel?: MessagingChannel;
+    approval?: { confirmationId: string; decision: "confirmed" | "declined" };
+  },
+) => Promise<MessagingReply>;
 
 export class MessagingError extends Error {
   constructor(

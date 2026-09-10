@@ -71,9 +71,11 @@ accepted; revoked, replayed, malformed or rate-limited credentials return 401.
 
 `list_devices` identifies targets. `run_device_bash` requires `device_id`, exact
 `command`, absolute `cwd`, and integer `timeout_ms`. Its preview describes the
-machine and full command. A session-authenticated web approval binds all these
-arguments, the tool version and conversation. Telegram and other messaging
-plugins can request this preview but cannot approve it.
+machine and full command. Approval through the authenticated web app or a
+single-use button in the owner’s linked Telegram chat binds all these arguments,
+the tool version and conversation. Messaging approval requires the complete
+preview, current owner/link, matching provider message and private chat, and an
+unexpired one-use token. Ordinary messages cannot approve actions.
 
 The confirmation coordinator consumes an approval once. The D1 queue also has a
 unique owner/workspace/confirmation constraint. There is intentionally no public

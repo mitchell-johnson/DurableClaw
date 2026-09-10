@@ -13,9 +13,17 @@ import {
   type MessagingDispatch,
   type MessagingEnv,
   type MessagingEvent,
+  type MessagingApprovalEvent,
+  type MessagingApproval,
+  type MessagingReply,
   type MessagingRegistry,
 } from "./plugin";
 import { telegramPlugin } from "./telegram";
+import {
+  consumeApproval,
+  pruneApprovals,
+  sendApprovalCards,
+} from "./approvals";
 
 export const messagingRegistry = createMessagingRegistry([telegramPlugin]);
 const LINK_TTL_MS = 10 * 60_000;
@@ -91,6 +99,7 @@ export async function sendLinkedReply(
     requestId: string;
     messageId: string;
     text: string;
+    approvals?: MessagingApproval[];
   },
   registry: MessagingRegistry = messagingRegistry,
 ): Promise<"done" | "pending"> {
@@ -141,6 +150,7 @@ export async function sendLinkedReply(
         chatId: link.chat_id,
         text: boundedReply(reply.text),
       });
+      await sendApprovalCards(env, link, reply.approvals, plugin);
       status = "sent";
     } catch {
       status = "send_unknown";
@@ -357,6 +367,7 @@ async function prune(env: MessagingEnv, now: number): Promise<void> {
       "DELETE FROM messaging_deliveries WHERE expires_at<=?",
     ).bind(now),
   ]);
+  await pruneApprovals(env, now);
 }
 
 /** Requires an authenticated, same-origin owner request at the host router. */
@@ -487,15 +498,28 @@ async function redeem(
     .first<Link>();
 }
 
-function validEvent(event: MessagingEvent, now: number): boolean {
+function validEvent(
+  event: MessagingEvent | MessagingApprovalEvent,
+  now: number,
+): boolean {
   return (
     [event.eventId, event.senderId, event.chatId].every(
       (value) =>
         typeof value === "string" && value.length > 0 && value.length <= 128,
     ) &&
-    typeof event.content === "string" &&
-    event.content.trim().length > 0 &&
-    event.content.length <= 4096 &&
+    (event.kind === "approval"
+      ? [event.callbackId, event.messageId].every(
+          (value) =>
+            typeof value === "string" &&
+            value.length > 0 &&
+            value.length <= 128,
+        ) &&
+        typeof event.data === "string" &&
+        /^dc:[ad]:[A-Za-z0-9_-]{32}$/.test(event.data)
+      : (event.kind === undefined || event.kind === "message") &&
+        typeof event.content === "string" &&
+        event.content.trim().length > 0 &&
+        event.content.length <= 4096) &&
     Number.isSafeInteger(event.occurredAt) &&
     event.occurredAt >= now - MAX_EVENT_AGE_MS &&
     event.occurredAt <= now + 5 * 60_000
@@ -521,42 +545,82 @@ export async function handleMessagingWebhook(
     const event = await plugin.receive(request, env);
     const now = Date.now();
     if (!event || !validEvent(event, now)) return response({ ok: true });
-    const start = /^\/start(?:\s+([A-Za-z0-9_-]{32}))?\s*$/.exec(event.content);
+    let start: RegExpExecArray | null = null;
     let link: Link | null;
-    if (event.content.startsWith("/start")) {
-      if (!start?.[1]) return response({ ok: true });
-      link = await redeem(env, plugin.id, event, start[1], now);
-    } else {
-      link = await env.CONTROL_DB.prepare(
-        "SELECT * FROM messaging_links WHERE plugin_id=? AND sender_id=? AND chat_id=?",
-      )
-        .bind(plugin.id, event.senderId, event.chatId)
-        .first<Link>();
-    }
-    if (!link) return response({ ok: true });
-    await prune(env, now);
-    const requestId = `msg_${await hash(JSON.stringify([plugin.id, event.eventId]))}`;
-    // Do not evict live dedupe records at the cap; reject new work instead.
-    const claimed = await env.CONTROL_DB.prepare(
-      "INSERT OR IGNORE INTO messaging_deliveries(request_id,event_id,link_id,user_id,workspace_id,plugin_id,status,created_at,updated_at,expires_at) SELECT ?,?,?,?,?,?,'processing',?,?,? WHERE EXISTS(SELECT 1 FROM messaging_links WHERE id=?) AND (SELECT COUNT(*) FROM messaging_deliveries WHERE user_id=? AND workspace_id=?)<?",
-    )
-      .bind(
-        requestId,
-        event.eventId,
-        link.id,
-        link.user_id,
-        link.workspace_id,
-        plugin.id,
-        now,
-        now,
-        now + DELIVERY_TTL_MS,
-        link.id,
-        link.user_id,
-        link.workspace_id,
+    let requestId: string;
+    let approval:
+      | { confirmationId: string; decision: "confirmed" | "declined" }
+      | undefined;
+    if (event.kind === "approval") {
+      await prune(env, now);
+      const consumed = await consumeApproval(
+        env,
+        plugin,
+        event,
         MAX_RETAINED_DELIVERIES,
+      );
+      try {
+        await plugin.answerCallback?.(env, {
+          callbackId: event.callbackId,
+          text: consumed
+            ? "Decision received."
+            : "This approval is unavailable. Review the action in DurableClaw.",
+        });
+      } catch {
+        /* Ephemeral provider feedback must not affect the decision. */
+      }
+      if (!consumed) return response({ ok: true });
+      link = consumed.link;
+      requestId = consumed.requestId;
+      approval = {
+        confirmationId: consumed.confirmationId,
+        decision: consumed.decision,
+      };
+      try {
+        await plugin.clearApproval?.(env, {
+          chatId: event.chatId,
+          messageId: event.messageId,
+        });
+      } catch {
+        /* The consumed token stays invalid even if its buttons remain. */
+      }
+    } else {
+      start = /^\/start(?:\s+([A-Za-z0-9_-]{32}))?\s*$/.exec(event.content);
+      if (event.content.startsWith("/start")) {
+        if (!start?.[1]) return response({ ok: true });
+        link = await redeem(env, plugin.id, event, start[1], now);
+      } else {
+        link = await env.CONTROL_DB.prepare(
+          "SELECT * FROM messaging_links WHERE plugin_id=? AND sender_id=? AND chat_id=?",
+        )
+          .bind(plugin.id, event.senderId, event.chatId)
+          .first<Link>();
+      }
+      if (!link) return response({ ok: true });
+      await prune(env, now);
+      requestId = `msg_${await hash(JSON.stringify([plugin.id, event.eventId]))}`;
+      // Do not evict live dedupe records at the cap; reject new work instead.
+      const claimed = await env.CONTROL_DB.prepare(
+        "INSERT OR IGNORE INTO messaging_deliveries(request_id,event_id,link_id,user_id,workspace_id,plugin_id,status,created_at,updated_at,expires_at) SELECT ?,?,?,?,?,?,'processing',?,?,? WHERE EXISTS(SELECT 1 FROM messaging_links WHERE id=?) AND (SELECT COUNT(*) FROM messaging_deliveries WHERE user_id=? AND workspace_id=?)<?",
       )
-      .run();
-    if (!claimed.meta.changes) return response({ ok: true });
+        .bind(
+          requestId,
+          event.eventId,
+          link.id,
+          link.user_id,
+          link.workspace_id,
+          plugin.id,
+          now,
+          now,
+          now + DELIVERY_TTL_MS,
+          link.id,
+          link.user_id,
+          link.workspace_id,
+          MAX_RETAINED_DELIVERIES,
+        )
+        .run();
+      if (!claimed.meta.changes) return response({ ok: true });
+    }
     const status = async (value: string) => {
       await env.CONTROL_DB.prepare(
         "UPDATE messaging_deliveries SET status=?,updated_at=? WHERE request_id=?",
@@ -565,10 +629,11 @@ export async function handleMessagingWebhook(
         .run();
     };
     let text =
-      "Connected to DurableClaw. Send a message to talk to your agent. Approve actions only in the DurableClaw app.";
+      "Connected to DurableClaw. Send a message to talk to your agent. Use approval buttons to review actions, or send /approvals to see pending actions.";
+    let result: MessagingReply | undefined;
     if (!start) {
       try {
-        const result = await dispatch(
+        result = await dispatch(
           {
             userId: link.user_id,
             workspaceId: link.workspace_id,
@@ -577,7 +642,17 @@ export async function handleMessagingWebhook(
           {
             conversationId: link.conversation_id,
             requestId,
-            content: event.content,
+            content:
+              event.kind === "approval"
+                ? "Approval button selected."
+                : event.content,
+            channel: {
+              linkId: link.id,
+              pluginId: link.plugin_id,
+              senderId: link.sender_id,
+              chatId: link.chat_id,
+            },
+            ...(approval ? { approval } : {}),
           },
         );
         text = boundedReply(result.text);
@@ -587,9 +662,17 @@ export async function handleMessagingWebhook(
       }
     }
     const stillLinked = await env.CONTROL_DB.prepare(
-      "SELECT id FROM messaging_links WHERE id=?",
+      "SELECT id FROM messaging_links WHERE id=? AND user_id=? AND workspace_id=? AND plugin_id=? AND sender_id=? AND chat_id=? AND conversation_id=?",
     )
-      .bind(link.id)
+      .bind(
+        link.id,
+        link.user_id,
+        link.workspace_id,
+        link.plugin_id,
+        link.sender_id,
+        link.chat_id,
+        link.conversation_id,
+      )
       .first();
     if (!stillLinked) {
       await status("unlinked");
@@ -598,6 +681,7 @@ export async function handleMessagingWebhook(
     await status("sending");
     try {
       await plugin.send(env, { chatId: link.chat_id, text });
+      await sendApprovalCards(env, link, result?.approvals, plugin);
     } catch {
       await status("send_unknown");
       return response({ ok: true });

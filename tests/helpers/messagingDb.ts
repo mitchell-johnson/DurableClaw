@@ -10,6 +10,12 @@ export function createMessagingDb() {
       "utf8",
     ),
   );
+  sql.exec(
+    readFileSync(
+      new URL("../../migrations/0004_messaging_approvals.sql", import.meta.url),
+      "utf8",
+    ).replace(/^--.*$/gm, ""),
+  );
   const statement = (
     query: string,
     bindings: unknown[] = [],

@@ -3,6 +3,7 @@ import { env, SELF, runInDurableObject } from "cloudflare:test";
 import migration1 from "../../migrations/0001_control.sql?raw";
 import migration2 from "../../migrations/0002_messaging.sql?raw";
 import migration3 from "../../migrations/0003_devices.sql?raw";
+import migration4 from "../../migrations/0004_messaging_approvals.sql?raw";
 import { createDeviceTools } from "../../src/devices/tools";
 import { doName } from "../../src/durable-objects/assistant/principal";
 import {
@@ -22,7 +23,7 @@ const auth = {
 };
 const owner = { userId: "owner", workspaceId: "default", role: "owner" };
 beforeAll(async () => {
-  for (const migration of [migration1, migration2, migration3])
+  for (const migration of [migration1, migration2, migration3, migration4])
     for (const sql of migration
       .replace(/--.*$/gm, "")
       .split(";")

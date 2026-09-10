@@ -12,6 +12,7 @@ import { workspacePrefix } from "../../src/storage/workspace";
 import {
   decideToolConfirmation,
   ensureToolConfirmationsSchema,
+  pendingToolConfirmationReviews,
 } from "../../src/durable-objects/assistant/toolConfirmations";
 import { createSqliteStorage } from "../helpers/sqlite";
 
@@ -121,6 +122,99 @@ function fixture() {
 }
 
 describe("approved gogcli tools", () => {
+  it("shows the entire inline Gmail body in its stored Telegram approval", async () => {
+    const f = fixture();
+    const pending = JSON.parse(await f.tools.gog_execute.execute(sendArgs));
+    const [review] = pendingToolConfirmationReviews(
+      f.sql,
+      "google-conversation",
+    );
+    expect(review.confirmationId).toBe(pending.confirmation_id);
+    expect(review.preview).toContain(
+      JSON.stringify(sendArgs.arguments.flags.body),
+    );
+    expect(review.preview).toContain(sendArgs.arguments.flags.to);
+    expect(f.executeBodies).toEqual([]);
+  });
+  it("shows every complete UTF-8 input file in Telegram while preserving the web hash summary", async () => {
+    const f = fixture();
+    const body =
+      "Kia ora — the exact message body.\nSecond line remains visible.";
+    const attachment = "Every attachment is reviewed too.";
+    const input = {
+      ...sendArgs,
+      arguments: {
+        command: "gmail.send",
+        flags: {
+          to: "recipient@example.test",
+          subject: "Agenda",
+          "body-file": "input:body.txt",
+          attach: ["input:notes.txt"],
+        },
+        files: [
+          {
+            name: "body.txt",
+            content_base64: Buffer.from(body).toString("base64"),
+          },
+          {
+            name: "notes.txt",
+            content_base64: Buffer.from(attachment).toString("base64"),
+          },
+        ],
+      },
+    };
+    const pending = JSON.parse(await f.tools.gog_execute.execute(input));
+    expect(pending.needs_confirmation).toBe(true);
+    expect(pending.preview).toContain('"sha256":');
+    expect(pending.preview).not.toContain(body.split("\n")[0]);
+    const [review] = pendingToolConfirmationReviews(
+      f.sql,
+      "google-conversation",
+    );
+    expect(review.confirmationId).toBe(pending.confirmation_id);
+    expect(review.preview).toContain(JSON.stringify(body));
+    expect(review.preview).toContain(JSON.stringify(attachment));
+    expect(review.preview).toContain("body.txt");
+    expect(review.preview).toContain("notes.txt");
+    expect(f.executeBodies).toEqual([]);
+  });
+  it.each([
+    ["binary", Buffer.from([0, 1, 2, 3])],
+    ["invalid UTF-8", Buffer.from([0xc3, 0x28])],
+    ["hidden formatting", Buffer.from("Visible text\u202econcealed")],
+    ["byte order mark", Buffer.from("\ufeffHidden prefix")],
+    ["oversized", Buffer.from("Complete large body ".repeat(300))],
+  ])(
+    "keeps %s file inputs available only for web approval",
+    async (_kind, bytes) => {
+      const f = fixture();
+      const pending = JSON.parse(
+        await f.tools.gog_execute.execute({
+          ...sendArgs,
+          arguments: {
+            command: "gmail.send",
+            flags: {
+              to: "recipient@example.test",
+              subject: "Agenda",
+              "body-file": "input:body.txt",
+            },
+            files: [
+              {
+                name: "body.txt",
+                content_base64: (bytes as Buffer).toString("base64"),
+              },
+            ],
+          },
+        }),
+      );
+      expect(pending.needs_confirmation).toBe(true);
+      expect(pending.preview).toContain('"sha256":');
+      expect(
+        pendingToolConfirmationReviews(f.sql, "google-conversation"),
+      ).toEqual([]);
+      expect(f.executeBodies).toEqual([]);
+    },
+  );
   it("shows actionable cleanup details on an unknown invocation without retrying it", async () => {
     const f = fixture();
     const id = crypto.randomUUID();

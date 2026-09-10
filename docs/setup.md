@@ -99,7 +99,7 @@ For production device access, use the built-in [Cloudflare Access authentication
 
 For direct email/password and passkey sign-in, enable [native authentication](native-auth.md). Credentials and sessions stay in a dedicated Durable Object. Initial setup uses the verified owner’s GitHub login; a recent passkey login can recover a password.
 
-Apply the new D1 migrations, then use **Connections** in the web app to link Telegram to your current conversation and create a private pairing code for each Mac. Follow [Telegram setup and plugin authoring](messaging.md) and [Mac installation](device-daemon.md). The daemon requires Node.js 22.12 or newer and runs as the logged-in user. Bash has that user's full permissions, and each execution needs web approval. See [device APIs and recovery semantics](devices-api.md).
+Apply the new D1 migrations, then use **Connections** in the web app to link Telegram to your current conversation and create a private pairing code for each Mac. Follow [Telegram setup and plugin authoring](messaging.md) and [Mac installation](device-daemon.md). The daemon requires Node.js 22.12 or newer and runs as the logged-in user. Bash has that user's full permissions, and each execution needs approval in the web app or through the linked Telegram approval buttons. See [device APIs and recovery semantics](devices-api.md).
 
 Connect Gmail and other Google services through the [external service connector setup](service-connectors.md). A native TypeScript port of gogcli runs entirely inside a credential Durable Object, which owns OAuth and invocation recovery. Generic commands require exact web approval.
 

@@ -5,6 +5,7 @@ import { createInternalAuthHeaders } from "../src/utils/internalAuth";
 import { defineConfirmTool } from "../src/action-library/helpers";
 import { makeSqliteConfirmationCoordinator } from "../src/durable-objects/assistant/toolConfirmations";
 import { issueToolConfirmation } from "../src/durable-objects/assistant/toolConfirmations";
+import { createMessagingDb } from "./helpers/messagingDb";
 afterEach(() => vi.unstubAllGlobals());
 
 async function fixture(sql = createSqliteStorage()) {
@@ -46,9 +47,9 @@ async function fixture(sql = createSqliteStorage()) {
     },
     env.INTERNAL_AUTH_SECRET,
   );
-  const send = (data: object) =>
+  const send = (data: object, path = "/channel-message") =>
     agent.fetch(
-      new Request("https://agent.internal/channel-message", {
+      new Request("https://agent.internal" + path, {
         method: "POST",
         headers,
         body: JSON.stringify(data),
@@ -62,6 +63,178 @@ const message = {
   content: "Hello from Telegram",
 };
 describe("internal messaging turn bridge", () => {
+  async function linkedFixture() {
+    const f = await fixture();
+    const control = createMessagingDb();
+    f.agent.env.CONTROL_DB = control.db;
+    f.agent.ensureConversationRow("conversation");
+    const channel = {
+      linkId: "link",
+      pluginId: "telegram",
+      senderId: "42",
+      chatId: "42",
+    };
+    const confirmationId = issueToolConfirmation(
+      f.sql,
+      {
+        conversationId: "conversation",
+        toolName: "write_file",
+        argsHash: "args",
+        preview: "Write notes.txt with exactly: hello",
+      },
+      Date.now(),
+    );
+    const request = {
+      conversationId: "conversation",
+      requestId: "approval-request",
+      content: "/approvals",
+      channel,
+    };
+    return { ...f, control, confirmationId, request };
+  }
+  it("returns the stored pending preview through /approvals without running the model", async () => {
+    const f = await linkedFixture();
+    const response = await f.send(f.request);
+    expect(response.status).toBe(200);
+    expect((await response.json()).approvals).toEqual([
+      expect.objectContaining({
+        confirmationId: f.confirmationId,
+        toolName: "write_file",
+        preview: "Write notes.txt with exactly: hello",
+      }),
+    ]);
+    expect(f.agent.handleUserMessage).not.toHaveBeenCalled();
+  });
+  it("approves and resumes a matching linked request exactly once", async () => {
+    const f = await linkedFixture();
+    const data = {
+      ...f.request,
+      approval: { confirmationId: f.confirmationId, decision: "confirmed" },
+    };
+    expect((await f.send(data, "/channel-decision")).status).toBe(200);
+    expect(f.agent.handleUserMessage).toHaveBeenCalledOnce();
+    expect(f.agent.handleUserMessage.mock.calls[0][2]).toContain(
+      f.confirmationId,
+    );
+    expect(
+      f.sql
+        .exec(
+          "SELECT status FROM tool_confirmations WHERE confirmation_id=?",
+          f.confirmationId,
+        )
+        .one().status,
+    ).toBe("approved");
+    expect((await f.send(data, "/channel-decision")).status).toBe(409);
+    expect(f.agent.handleUserMessage).toHaveBeenCalledOnce();
+  });
+  it("declines without starting a model turn", async () => {
+    const f = await linkedFixture();
+    expect(
+      (
+        await f.send(
+          {
+            ...f.request,
+            approval: {
+              confirmationId: f.confirmationId,
+              decision: "declined",
+            },
+          },
+          "/channel-decision",
+        )
+      ).status,
+    ).toBe(200);
+    expect(f.agent.handleUserMessage).not.toHaveBeenCalled();
+    expect(
+      f.sql
+        .exec(
+          "SELECT status FROM tool_confirmations WHERE confirmation_id=?",
+          f.confirmationId,
+        )
+        .one().status,
+    ).toBe("declined");
+    expect(
+      f.sql
+        .exec(
+          "SELECT role,content FROM messages WHERE conversation_id=?",
+          "conversation",
+        )
+        .toArray(),
+    ).toEqual([
+      {
+        role: "user",
+        content: `I declined confirmation ${f.confirmationId} for write_file in my linked messaging chat.`,
+      },
+      { role: "assistant", content: "Action declined. It will not run." },
+    ]);
+  });
+  it.each(["linkId", "pluginId", "senderId", "chatId"])(
+    "rejects a changed channel %s before approving",
+    async (field) => {
+      const f = await linkedFixture();
+      const response = await f.send(
+        {
+          ...f.request,
+          channel: { ...f.request.channel, [field]: "different" },
+          approval: { confirmationId: f.confirmationId, decision: "confirmed" },
+        },
+        "/channel-decision",
+      );
+      expect(response.status).toBe(403);
+      expect(f.agent.handleUserMessage).not.toHaveBeenCalled();
+      expect(
+        f.sql
+          .exec(
+            "SELECT status FROM tool_confirmations WHERE confirmation_id=?",
+            f.confirmationId,
+          )
+          .one().status,
+      ).toBe("pending");
+    },
+  );
+  it("rejects an unlinked or downgraded owner and a confirmation from another conversation", async () => {
+    const f = await linkedFixture();
+    const data = {
+      ...f.request,
+      approval: { confirmationId: f.confirmationId, decision: "confirmed" },
+    };
+    f.sql.exec(
+      "UPDATE tool_confirmations SET conversation_id='other' WHERE confirmation_id=?",
+      f.confirmationId,
+    );
+    expect((await f.send(data, "/channel-decision")).status).toBe(404);
+    f.sql.exec(
+      "UPDATE tool_confirmations SET conversation_id='conversation' WHERE confirmation_id=?",
+      f.confirmationId,
+    );
+    f.agent.env.AUTH = {
+      fetch: async () =>
+        Response.json({
+          userId: "owner",
+          workspaceId: "default",
+          role: "reader",
+        }),
+    };
+    expect((await f.send(data, "/channel-decision")).status).toBe(403);
+    delete f.agent.env.AUTH;
+    f.control.sql.exec("DELETE FROM messaging_links WHERE id='link'");
+    expect((await f.send(data, "/channel-decision")).status).toBe(403);
+    expect(f.agent.handleUserMessage).not.toHaveBeenCalled();
+  });
+  it("rejects expired requests and plain chat approval fields", async () => {
+    const f = await linkedFixture();
+    const data = {
+      ...f.request,
+      approval: { confirmationId: f.confirmationId, decision: "confirmed" },
+    };
+    expect((await f.send(data)).status).toBe(400);
+    f.sql.exec(
+      "UPDATE tool_confirmations SET expires_at=? WHERE confirmation_id=?",
+      Date.now() - 1,
+      f.confirmationId,
+    );
+    expect((await f.send(data, "/channel-decision")).status).toBe(409);
+    expect(f.agent.handleUserMessage).not.toHaveBeenCalled();
+  });
   it("does not let a downgraded owner approve an existing shell request", async () => {
     const f = await fixture();
     f.agent.ensureConversationRow(message.conversationId);

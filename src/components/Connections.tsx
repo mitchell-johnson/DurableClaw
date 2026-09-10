@@ -143,7 +143,8 @@ export function Connections({
       <h3>Messaging</h3>
       <p>
         Link a private chat to the conversation you currently have open. Review
-        and approve actions in this web app.
+        and approve actions here or with the buttons in your linked Telegram
+        chat.
       </p>
       {!conversationId && (
         <p className="notice">

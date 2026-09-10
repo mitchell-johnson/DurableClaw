@@ -282,8 +282,8 @@ export function ServiceConnections({ api }: { api: Api }) {
       <p>
         Enable read and write access for the selected Google services from the
         cloud. Review the selected permissions in Google before connecting.
-        Actions that change external services require your approval in this web
-        app.
+        Actions that change external services require your approval here or with
+        the buttons in your linked Telegram chat.
       </p>
       <div className="button-row">
         <button disabled={busy || loading} onClick={() => void load()}>

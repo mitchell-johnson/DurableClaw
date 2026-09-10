@@ -27,7 +27,7 @@ Commands run with the installing user's full filesystem, network, and applicatio
 
 The service is a user LaunchAgent and runs while that user is logged in; logout stops it. A sleeping or disconnected Mac cannot receive new commands. This follows [Apple's LaunchAgent lifecycle](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html).
 
-For a first check, ask DurableClaw to list devices and propose `pwd` on the named Mac. Review the exact device, command, directory, and timeout in the authenticated web approval prompt. After approval, inspect the asynchronous job result. Telegram can carry the request, but shell approval is performed in the authenticated web app.
+For a first check, ask DurableClaw to list devices and propose `pwd` on the named Mac. Review the exact device, command, directory, and timeout in the authenticated web app or linked Telegram approval card. After approval, inspect the asynchronous job result. Telegram approval is limited to the exact reviewed command and expires after ten minutes; ordinary chat replies cannot approve it.
 
 ## Storage and execution
 

@@ -78,7 +78,11 @@ import {
 import {
   makeSqliteConfirmationCoordinator,
   decideToolConfirmation,
+  ensureToolConfirmationReviews,
+  pendingToolConfirmationReviews,
+  deleteConversationConfirmations,
 } from "./assistant/toolConfirmations";
+import { channelSourceActive } from "./assistant/channelApprovals";
 import { RetrievalService } from "../services/retrieval/RetrievalService";
 import type { RetrievalContext } from "../services/retrieval/types";
 import { createMemoryRetrievalTool } from "../action-library/tools/retrieval";
@@ -706,6 +710,7 @@ export class NanoChatAgent implements DurableObject {
     void this.state.blockConcurrencyWhile(async () => {
       try {
         this.ensureSchema();
+        ensureToolConfirmationReviews(this.sql);
         this.restoreContextFromSql();
         if (this.context) {
           recoverPendingMemoryWrites(this.sql, (taskId) => {
@@ -1726,6 +1731,9 @@ CREATE TABLE IF NOT EXISTS context (
     if (url.pathname === "/channel-message" && request.method === "POST") {
       return this.handleChannelMessage(request);
     }
+    if (url.pathname === "/channel-decision" && request.method === "POST") {
+      return this.handleChannelDecision(request);
+    }
     if (url.pathname === "/device-policy" && request.method === "GET") {
       try {
         if (!this.context) throw new Error("Not initialized");
@@ -1866,6 +1874,7 @@ CREATE TABLE IF NOT EXISTS context (
     if (
       !validId(conversationId) ||
       !validId(requestId) ||
+      data.approval !== undefined ||
       typeof content !== "string" ||
       !content.trim() ||
       content.length > 32000
@@ -1882,20 +1891,37 @@ CREATE TABLE IF NOT EXISTS context (
         this.context.tenant_binding,
       );
       if (p.role !== "owner") throw new Error("Owner required");
+      if (
+        data.channel !== undefined &&
+        !(await channelSourceActive(this.env, p, conversationId, data.channel))
+      )
+        throw new Error("Channel link unavailable");
     } catch {
       return Response.json(
         { error: "Current authority unavailable" },
         { status: 403 },
       );
     }
-    const hash = await computeArgsHash({ conversationId, content });
+    const hash = await computeArgsHash({
+      conversationId,
+      content,
+      ...(data.channel === undefined ? {} : { channel: data.channel }),
+    });
+    const approvals = () =>
+      data.channel === undefined
+        ? []
+        : pendingToolConfirmationReviews(this.sql, conversationId);
     const claim = claimChannelRequest(
       this.sql,
       requestId,
       conversationId,
       hash,
     );
-    if (claim.status === "complete") return Response.json({ text: claim.text });
+    if (claim.status === "complete")
+      return Response.json({
+        text: claim.text,
+        ...(data.channel === undefined ? {} : { approvals: approvals() }),
+      });
     if (claim.status === "conflict")
       return Response.json(
         {
@@ -1905,6 +1931,14 @@ CREATE TABLE IF NOT EXISTS context (
         { status: 409 },
       );
     this.ensureConversationRow(conversationId);
+    if (data.channel !== undefined && content.trim() === "/approvals") {
+      const pending = approvals();
+      const text = pending.length
+        ? "Review the pending action details below. Use the approval buttons to decide; ordinary chat replies cannot approve actions."
+        : "No pending actions are available for Telegram approval in this conversation. Check DurableClaw for older or oversized requests.";
+      completeChannelRequest(this.sql, requestId, text);
+      return Response.json({ text, approvals: pending });
+    }
     // This preflight and entry into handleUserMessage are synchronous relative
     // to other messages. A rejected turn is retained, never reported as run.
     if (
@@ -1967,11 +2001,151 @@ CREATE TABLE IF NOT EXISTS context (
     const reply = (
       text +
       (pending
-        ? "\n\nApproval is required in the DurableClaw web app. Open this conversation to review the exact action; replying in this chat cannot approve it."
+        ? data.channel !== undefined
+          ? "\n\nAn action needs approval. Review its details and use the approval buttons, or open this conversation in DurableClaw. Ordinary chat replies cannot approve actions."
+          : "\n\nApproval is required in the DurableClaw web app. Open this conversation to review the exact action; replying in this chat cannot approve it."
         : "")
     ).slice(0, 16000);
     completeChannelRequest(this.sql, requestId, reply);
-    return Response.json({ text: reply });
+    return Response.json({
+      text: reply,
+      ...(data.channel === undefined ? {} : { approvals: approvals() }),
+    });
+  }
+  private async handleChannelDecision(request: Request): Promise<Response> {
+    let data: Record<string, unknown>;
+    try {
+      data = jsonObject(await boundedJson(request, 4096));
+    } catch {
+      return Response.json(
+        { error: "Invalid channel decision" },
+        { status: 400 },
+      );
+    }
+    const { conversationId, requestId, channel } = data;
+    const approval = data.approval as
+      { confirmationId?: unknown; decision?: unknown } | undefined;
+    if (
+      !validId(conversationId) ||
+      !validId(requestId) ||
+      !approval ||
+      !validId(approval.confirmationId) ||
+      !["confirmed", "declined"].includes(String(approval.decision))
+    )
+      return Response.json(
+        { error: "Invalid channel decision" },
+        { status: 400 },
+      );
+    try {
+      if (!this.context) throw new Error("Not initialized");
+      const principal = await authorizePrincipal(
+        this.env,
+        this.context.user_id,
+        this.context.tenant_binding,
+      );
+      if (
+        !(await channelSourceActive(
+          this.env,
+          principal,
+          conversationId,
+          channel,
+        ))
+      )
+        throw new Error("Channel unavailable");
+    } catch {
+      return Response.json(
+        { error: "Current channel authority unavailable" },
+        { status: 403 },
+      );
+    }
+    if (!this.getConversationRow(conversationId))
+      return Response.json(
+        { error: "Conversation not found" },
+        { status: 404 },
+      );
+    const confirmation = this.sql
+      .exec(
+        "SELECT c.conversation_id,c.tool_name,r.preview FROM tool_confirmations c LEFT JOIN tool_confirmation_reviews r USING(confirmation_id) WHERE c.confirmation_id=?",
+        approval.confirmationId,
+      )
+      .toArray()[0] as
+      | { conversation_id: string; tool_name: string; preview?: string }
+      | undefined;
+    if (!confirmation || confirmation.conversation_id !== conversationId)
+      return Response.json(
+        { error: "Confirmation not found" },
+        { status: 404 },
+      );
+    if (
+      !confirmation.preview ||
+      !decideToolConfirmation(
+        this.sql,
+        approval.confirmationId,
+        approval.decision as "confirmed" | "declined",
+        Date.now(),
+      )
+    )
+      return Response.json(
+        {
+          error: "Confirmation not pending or unavailable for channel approval",
+        },
+        { status: 409 },
+      );
+    const approved = approval.decision === "confirmed";
+    logInfo("DurableClaw confirmation decided", {
+      "do.name": "NanoChatAgent",
+      "conversation.id": conversationId,
+      "confirmation.id": approval.confirmationId,
+      "confirmation.decision": approval.decision,
+      "confirmation.transport": "messaging",
+    });
+    if (!approved) {
+      const content = `I declined confirmation ${approval.confirmationId} for ${confirmation.tool_name} in my linked messaging chat.`;
+      const text = "Action declined. It will not run.";
+      const userId = this.appendMessage({
+        conversationId,
+        role: "user",
+        content,
+      });
+      const replyId = this.appendMessage({
+        conversationId,
+        role: "assistant",
+        content: text,
+      });
+      this.sendToConversation(conversationId, {
+        type: "history_user_message",
+        content,
+        message_id: userId,
+      });
+      this.sendToConversation(conversationId, {
+        type: "assistant_message",
+        content: text,
+        message_id: replyId,
+      });
+      return Response.json({
+        text,
+        approvals: pendingToolConfirmationReviews(this.sql, conversationId),
+      });
+    }
+    // A real, single-use approval can resume immediately even if the preceding
+    // preview finished within the normal conversational rate-limit window.
+    if (
+      !this.processingConversations.has(conversationId) &&
+      !this.pendingMessages.has(conversationId)
+    )
+      this.lastMessageAt.delete(conversationId);
+    return this.handleChannelMessage(
+      new Request("https://agent.internal/channel-message", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          conversationId,
+          requestId,
+          channel,
+          content: `I approved confirmation ${approval.confirmationId}. Continue with the approved ${confirmation.tool_name} action using the same arguments and that confirmation ID. This approval covers only that exact action.`,
+        }),
+      }),
+    );
   }
   private static sanitizeAdvisoryPage(raw: unknown): {
     path?: string;
@@ -2995,6 +3169,7 @@ CREATE TABLE IF NOT EXISTS context (
       orphanedVectorIds.add(id);
     markMemoriesForDeletion(this.sql, [...orphanedVectorIds]);
     if (orphanedVectorIds.size) this.queueMemoryDeletionCleanup();
+    deleteConversationConfirmations(this.sql, conversationId);
     this.sql.exec(
       "DELETE FROM messages WHERE conversation_id = ?",
       conversationId,
@@ -3637,6 +3812,7 @@ CREATE TABLE IF NOT EXISTS context (
           break;
         case "clear":
           this.handleCancelTurn(socketCtx.conversation_id, undefined, true);
+          deleteConversationConfirmations(this.sql, socketCtx.conversation_id);
           this.sql.exec(
             "DELETE FROM messages WHERE conversation_id = ?",
             socketCtx.conversation_id,
