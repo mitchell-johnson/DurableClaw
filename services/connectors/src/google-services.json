@@ -1,0 +1,240 @@
+{
+  "services": [
+    {
+      "service": "gmail",
+      "user": true,
+      "scopes": [
+        "https://www.googleapis.com/auth/gmail.modify",
+        "https://www.googleapis.com/auth/gmail.settings.basic",
+        "https://www.googleapis.com/auth/gmail.settings.sharing"
+      ],
+      "apis": ["Gmail API"]
+    },
+    {
+      "service": "calendar",
+      "user": true,
+      "scopes": ["https://www.googleapis.com/auth/calendar"],
+      "apis": ["Calendar API"]
+    },
+    {
+      "service": "chat",
+      "user": true,
+      "scopes": [
+        "https://www.googleapis.com/auth/chat.spaces",
+        "https://www.googleapis.com/auth/chat.messages",
+        "https://www.googleapis.com/auth/chat.memberships",
+        "https://www.googleapis.com/auth/chat.users.readstate.readonly",
+        "https://www.googleapis.com/auth/chat.messages.reactions.create",
+        "https://www.googleapis.com/auth/chat.messages.reactions.readonly"
+      ],
+      "apis": ["Chat API"]
+    },
+    {
+      "service": "classroom",
+      "user": true,
+      "scopes": [
+        "https://www.googleapis.com/auth/classroom.courses",
+        "https://www.googleapis.com/auth/classroom.rosters",
+        "https://www.googleapis.com/auth/classroom.coursework.students",
+        "https://www.googleapis.com/auth/classroom.coursework.me",
+        "https://www.googleapis.com/auth/classroom.courseworkmaterials",
+        "https://www.googleapis.com/auth/classroom.announcements",
+        "https://www.googleapis.com/auth/classroom.topics",
+        "https://www.googleapis.com/auth/classroom.guardianlinks.students",
+        "https://www.googleapis.com/auth/classroom.profile.emails",
+        "https://www.googleapis.com/auth/classroom.profile.photos"
+      ],
+      "apis": ["Classroom API"]
+    },
+    {
+      "service": "drive",
+      "user": true,
+      "scopes": ["https://www.googleapis.com/auth/drive"],
+      "apis": ["Drive API"]
+    },
+    {
+      "service": "driveactivity",
+      "user": true,
+      "scopes": ["https://www.googleapis.com/auth/drive.activity.readonly"],
+      "apis": ["Drive Activity API"],
+      "note": "Read-only audit/activity scope; authorize with --services driveactivity"
+    },
+    {
+      "service": "drivelabels",
+      "user": true,
+      "scopes": ["https://www.googleapis.com/auth/drive.labels.readonly"],
+      "apis": ["Drive Labels API"],
+      "note": "Read-only Drive label schema; authorize with --services drivelabels"
+    },
+    {
+      "service": "docs",
+      "user": true,
+      "scopes": [
+        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/documents"
+      ],
+      "apis": ["Docs API", "Drive API"],
+      "note": "Export/copy/create via Drive"
+    },
+    {
+      "service": "slides",
+      "user": true,
+      "scopes": [
+        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/presentations"
+      ],
+      "apis": ["Slides API", "Drive API"],
+      "note": "Create/edit presentations"
+    },
+    {
+      "service": "contacts",
+      "user": true,
+      "scopes": [
+        "https://www.googleapis.com/auth/contacts",
+        "https://www.googleapis.com/auth/contacts.other.readonly",
+        "https://www.googleapis.com/auth/directory.readonly"
+      ],
+      "apis": ["People API"],
+      "note": "Contacts + other contacts + directory"
+    },
+    {
+      "service": "tasks",
+      "user": true,
+      "scopes": ["https://www.googleapis.com/auth/tasks"],
+      "apis": ["Tasks API"]
+    },
+    {
+      "service": "sheets",
+      "user": true,
+      "scopes": [
+        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/spreadsheets"
+      ],
+      "apis": ["Sheets API", "Drive API"],
+      "note": "Export via Drive"
+    },
+    {
+      "service": "people",
+      "user": true,
+      "scopes": ["profile"],
+      "apis": ["People API"],
+      "note": "OIDC profile scope"
+    },
+    {
+      "service": "forms",
+      "user": true,
+      "scopes": [
+        "https://www.googleapis.com/auth/forms.body",
+        "https://www.googleapis.com/auth/forms.responses.readonly"
+      ],
+      "apis": ["Forms API"]
+    },
+    {
+      "service": "sites",
+      "user": true,
+      "scopes": ["https://www.googleapis.com/auth/drive"],
+      "apis": ["Drive API"],
+      "note": "New Google Sites are exposed as Drive files"
+    },
+    {
+      "service": "meet",
+      "user": true,
+      "scopes": [
+        "https://www.googleapis.com/auth/meetings.space.created",
+        "https://www.googleapis.com/auth/meetings.space.readonly",
+        "https://www.googleapis.com/auth/meetings.space.settings"
+      ],
+      "apis": ["Meet REST API"]
+    },
+    {
+      "service": "appscript",
+      "user": true,
+      "scopes": [
+        "https://www.googleapis.com/auth/script.projects",
+        "https://www.googleapis.com/auth/script.deployments",
+        "https://www.googleapis.com/auth/script.processes"
+      ],
+      "apis": ["Apps Script API"]
+    },
+    {
+      "service": "analytics",
+      "user": true,
+      "scopes": ["https://www.googleapis.com/auth/analytics.readonly"],
+      "apis": ["Analytics Admin API", "Analytics Data API"],
+      "note": "GA4 account summaries + reporting"
+    },
+    {
+      "service": "searchconsole",
+      "user": true,
+      "scopes": ["https://www.googleapis.com/auth/webmasters"],
+      "apis": ["Search Console API"],
+      "note": "Search Analytics + sitemap management"
+    },
+    {
+      "service": "adsense",
+      "user": false,
+      "scopes": ["https://www.googleapis.com/auth/adsense.readonly"],
+      "apis": ["AdSense Management API"],
+      "note": "Consumer OAuth; explicit opt-in with --services adsense; read-only"
+    },
+    {
+      "service": "ads",
+      "user": true,
+      "scopes": ["https://www.googleapis.com/auth/adwords"],
+      "apis": ["Google Ads API"],
+      "note": "OAuth scope only"
+    },
+    {
+      "service": "groups",
+      "user": false,
+      "scopes": [
+        "https://www.googleapis.com/auth/cloud-identity.groups.readonly"
+      ],
+      "apis": ["Cloud Identity API"],
+      "note": "Workspace only"
+    },
+    {
+      "service": "keep",
+      "user": false,
+      "scopes": ["https://www.googleapis.com/auth/keep"],
+      "apis": ["Keep API"],
+      "note": "Workspace only; service account (domain-wide delegation)"
+    },
+    {
+      "service": "admin",
+      "user": false,
+      "scopes": [
+        "https://www.googleapis.com/auth/admin.directory.user",
+        "https://www.googleapis.com/auth/admin.directory.group",
+        "https://www.googleapis.com/auth/admin.directory.group.member"
+      ],
+      "apis": ["Admin SDK Directory API"],
+      "note": "Workspace only; service account with domain-wide delegation required"
+    },
+    {
+      "service": "youtube",
+      "user": true,
+      "scopes": ["https://www.googleapis.com/auth/youtube.readonly"],
+      "apis": ["YouTube Data API v3"],
+      "note": "Most read operations also work with API key only (config youtube_api_key or GOG_YOUTUBE_API_KEY)"
+    },
+    {
+      "service": "photos",
+      "user": true,
+      "scopes": [
+        "https://www.googleapis.com/auth/photoslibrary.readonly.appcreateddata"
+      ],
+      "apis": ["Photos Library API"],
+      "note": "Read-only app-created media only after Google Photos Library API scope changes"
+    },
+    {
+      "service": "photospicker",
+      "user": false,
+      "scopes": [
+        "https://www.googleapis.com/auth/photospicker.mediaitems.readonly"
+      ],
+      "apis": ["Photos Picker API"],
+      "note": "Consumer OAuth; explicit opt-in with --services photospicker; selected media only"
+    }
+  ]
+}

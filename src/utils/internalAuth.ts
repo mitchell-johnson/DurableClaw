@@ -4,7 +4,13 @@ export interface InternalAuthContext {
   organizationId: string;
   tenantBinding: string;
   role: string;
+  /** Opaque database reference, never a bearer session token. */
+  identitySessionId?: string;
   ts: number;
+}
+
+export function validIdentitySessionId(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(value);
 }
 
 const MAX_AGE_MS = 5 * 60_000;
@@ -79,6 +85,11 @@ export async function validateInternalAuth(
           typeof value[field] === "string" &&
           (value[field] as string).length > 0,
       )
+    )
+      return null;
+    if (
+      value.identitySessionId !== undefined &&
+      !validIdentitySessionId(value.identitySessionId)
     )
       return null;
     if (typeof value.ts !== "number" || !Number.isFinite(value.ts)) return null;

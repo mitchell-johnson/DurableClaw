@@ -3,6 +3,16 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createApi, createChatEndpoints } from "../../src/hooks/api";
 afterEach(() => vi.unstubAllGlobals());
 describe("authenticated browser transport", () => {
+  it("marks bodyless Access mutations as JSON without adding a bearer credential", async () => {
+    const fetch = vi.fn(async () => Response.json({ ok: true }));
+    vi.stubGlobal("fetch", fetch);
+    await createApi("")("/api/devices/device-id", { method: "DELETE" });
+    const headers = new Headers(
+      (fetch.mock.calls[0][1] as RequestInit).headers,
+    );
+    expect(headers.get("content-type")).toBe("application/json");
+    expect(headers.has("authorization")).toBe(false);
+  });
   it("keeps the access token in request headers and uses fresh one-time tickets on reconnect", async () => {
     let count = 0;
     const fetch = vi.fn(async (path: string, init: RequestInit) => {

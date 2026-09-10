@@ -6,3 +6,27 @@ MCP_CREDENTIALS_SECRET=
 CHAT_MODEL=
 BACKGROUND_MODEL=
 BATCH_MODEL=
+# Optional strict provider slug for model requests, with no provider fallback.
+OPENROUTER_PROVIDER=
+# Defaults to max. Use high for Gemini 3.8 Flash's highest advertised effort.
+BACKGROUND_REASONING_EFFORT=
+
+# Production browser authentication. Configure all three together.
+# Any nonempty Access setting disables built-in AGENT_TOKEN authentication.
+ACCESS_TEAM_DOMAIN=
+ACCESS_AUD=
+ACCESS_OWNER_EMAIL=
+
+# Telegram plugin secrets (keep these server-side).
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_WEBHOOK_SECRET=
+
+# Explicitly permits the device API on loopback HTTP for local development.
+# LOCAL_DEV=true
+# External service connectors: same random 32+ character secret in both Workers.
+# OAuth client secret and credential encryption key belong ONLY to the connector Worker.
+CONNECTOR_AUTH_SECRET=
+# Native password/passkey sign-in. Use an exact HTTPS origin and a separate
+# random secret (at least 32 bytes); enroll the owner through verified Access.
+# AUTH_ORIGIN=https://durableclaw.example.com
+# AUTH_SECRET=

@@ -16,6 +16,13 @@ jobs:
       - run: npm ci
       - run: npm run format:check
       - run: npm run check
+      - run: npm run check:connectors
+      - run: npm run check:vendor
       - run: npm test
+      - run: npm run test:smoke
+      - run: npm run test:device
       - run: npm run test:workers
+      - run: npm run test:identity
+      - run: npm run test:connectors
       - run: npm run build
+      - run: npm run build:connectors

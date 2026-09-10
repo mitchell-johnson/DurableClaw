@@ -1,8 +1,9 @@
+import { modelFor, OPENROUTER_BASE_URL } from "../config";
 import {
-  BACKGROUND_REASONING_EFFORT,
-  modelFor,
-  OPENROUTER_BASE_URL,
-} from "../config";
+  backgroundReasoningEffort,
+  openRouterProvider,
+  type OpenRouterRoutingEnv,
+} from "./openrouterRouting";
 
 export type BatchStatus =
   | "validating"
@@ -33,7 +34,7 @@ export interface OpenRouterBatch {
   results: BatchResult[] | null;
 }
 
-export type BatchEnv = {
+export type BatchEnv = OpenRouterRoutingEnv & {
   OPENROUTER_API_KEY?: string;
   CHAT_MODEL?: string;
   BACKGROUND_MODEL?: string;
@@ -89,8 +90,8 @@ function serializeBatchRequest(
   // Order is part of the wire protocol: OpenRouter stream-parses endpoint and
   // model before requests. The async endpoint takes the base model slug;
   // the configured :batch variant identifies its pricing/routing capability.
-  // Its provider inventory differs from synchronous inference, so do not
-  // impose the synchronous provider pin on these requests.
+  // Provider preferences are unsupported by this endpoint. createBatch
+  // rejects pinned deployments before dispatch instead of weakening routing.
   return JSON.stringify({
     endpoint: "/v1/chat/completions",
     model: modelFor(env, "batch").replace(/:batch$/, ""),
@@ -104,7 +105,7 @@ function serializeBatchRequest(
         ...(request.maxTokens !== undefined
           ? { max_tokens: request.maxTokens }
           : {}),
-        reasoning: { effort: BACKGROUND_REASONING_EFFORT },
+        reasoning: { effort: backgroundReasoningEffort(env) },
       },
     })),
   });
@@ -119,6 +120,24 @@ export async function createBatch(
   requests: readonly BatchRequest[],
 ): Promise<OpenRouterBatch> {
   const auth = authorization(env);
+  if (openRouterProvider(env))
+    throw new BatchError(
+      "OpenRouter Batch API cannot enforce OPENROUTER_PROVIDER; use durable synchronous housekeeping",
+    );
+  validateRequests(requests);
+
+  const body = serializeBatchRequest(requests, env);
+  if (new TextEncoder().encode(body).byteLength > MAX_BATCH_REQUEST_BYTES) {
+    throw new BatchError("OpenRouter batch request exceeds size limit");
+  }
+  return fetchBatch(BATCH_URL, {
+    method: "POST",
+    body,
+    headers: { Authorization: auth, "Content-Type": "application/json" },
+  });
+}
+
+function validateRequests(requests: readonly BatchRequest[]): void {
   const ids = new Set<string>();
   if (
     requests.length === 0 ||
@@ -139,16 +158,64 @@ export async function createBatch(
   ) {
     throw new BatchError("Invalid OpenRouter batch requests");
   }
+}
 
-  const body = serializeBatchRequest(requests, env);
-  if (new TextEncoder().encode(body).byteLength > MAX_BATCH_REQUEST_BYTES) {
-    throw new BatchError("OpenRouter batch request exceeds size limit");
-  }
-  return fetchBatch(BATCH_URL, {
-    method: "POST",
-    body,
-    headers: { Authorization: auth, "Content-Type": "application/json" },
+/** One inference-only task; its caller persists intent and the returned text. */
+export async function runPinnedHousekeeping(
+  env: BatchEnv,
+  request: BatchRequest,
+): Promise<string | null> {
+  const provider = openRouterProvider(env);
+  if (!provider)
+    throw new BatchError("Pinned housekeeping requires OPENROUTER_PROVIDER");
+  validateRequests([request]);
+  const serialized = JSON.parse(serializeBatchRequest([request], env));
+  const body = JSON.stringify({
+    model: serialized.model,
+    ...serialized.requests[0].body,
+    provider,
+    stream: false,
   });
+  if (new TextEncoder().encode(body).byteLength > MAX_BATCH_REQUEST_BYTES)
+    throw new BatchError("OpenRouter housekeeping request exceeds size limit");
+  try {
+    const response = await fetch(`${OPENROUTER_BASE_URL}/chat/completions`, {
+      method: "POST",
+      headers: {
+        Authorization: authorization(env),
+        "Content-Type": "application/json",
+      },
+      body,
+      redirect: "manual",
+      signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+    });
+    if (!response.ok) {
+      await response.body?.cancel().catch(() => {});
+      throw new BatchError(
+        `OpenRouter housekeeping request failed (HTTP ${response.status})`,
+      );
+    }
+    return batchResultText(
+      {
+        id: "synchronous",
+        status: "completed",
+        results: [
+          {
+            custom_id: request.customId,
+            error: null,
+            response: {
+              status_code: response.status,
+              body: await readBoundedJson(response),
+            },
+          },
+        ],
+      },
+      request.customId,
+    );
+  } catch (error) {
+    if (error instanceof BatchError) throw error;
+    throw new BatchError("OpenRouter housekeeping transport failed");
+  }
 }
 
 export async function getBatch(
@@ -174,7 +241,7 @@ async function fetchBatch(
   try {
     const response = await fetch(url, {
       ...init,
-      redirect: "error",
+      redirect: "manual",
       signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
     });
     if (!response.ok) {

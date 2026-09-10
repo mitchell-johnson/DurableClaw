@@ -1,9 +1,19 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { useAgentChat, type ToolResultRecord } from "./hooks/useAgentChat";
 import { createApi, createChatEndpoints, type Api } from "./hooks/api";
+import { Connections } from "./components/Connections";
+import { ServiceConnections } from "./components/ServiceConnections";
+import { NativeLogin } from "./components/NativeLogin";
+import { AccountSecurity } from "./components/AccountSecurity";
+import {
+  authRequest,
+  authErrorStatus,
+  type AuthMode,
+  type AuthOptions,
+} from "./hooks/authClient";
 import "./styles.css";
 
-type Tab = "chat" | "settings" | "memory" | "activity";
+type Tab = "chat" | "settings" | "memory" | "activity" | "connections";
 function errorText(error: unknown) {
   return error instanceof Error
     ? error.message
@@ -11,18 +21,116 @@ function errorText(error: unknown) {
 }
 
 export function App() {
-  const [token, setToken] = useState("");
+  const [session, setSession] = useState<{
+    token: string;
+    mode: AuthMode;
+  } | null>(null);
+  const [options, setOptions] = useState<AuthOptions>({
+    enabled: false,
+    accessRecovery: false,
+  });
+  const [checking, setChecking] = useState(true);
   const [draft, setDraft] = useState("");
   const [error, setError] = useState("");
   const [pending, setPending] = useState(false);
-  if (token)
+  useEffect(() => {
+    let active = true;
+    void (async () => {
+      const [configuration, current] = await Promise.allSettled([
+        authRequest<AuthOptions>("/api/auth/options"),
+        authRequest<{ authenticated: boolean; auth_mode: AuthMode }>(
+          "/api/session",
+        ),
+      ]);
+      if (!active) return;
+      if (configuration.status === "fulfilled")
+        setOptions({
+          enabled: configuration.value?.enabled === true,
+          accessRecovery: configuration.value?.accessRecovery === true,
+        });
+      let exchangingAccess = false;
+      try {
+        if (
+          current.status === "fulfilled" &&
+          current.value.authenticated &&
+          ["native", "access"].includes(current.value.auth_mode)
+        ) {
+          if (
+            current.value.auth_mode === "access" &&
+            configuration.status === "fulfilled" &&
+            configuration.value?.enabled === true
+          ) {
+            window.location.assign("/api/auth/access");
+            exchangingAccess = true;
+            return;
+          }
+          await createApi("")("/api/agent/init", {
+            method: "POST",
+            body: "{}",
+          });
+          if (active) setSession({ token: "", mode: current.value.auth_mode });
+        } else if (
+          current.status === "rejected" &&
+          authErrorStatus(current.reason) !== 401
+        ) {
+          setError("Your session could not be checked. Please sign in again.");
+        }
+      } catch {
+        if (active)
+          setError(
+            "The workspace could not be opened. Please try signing in again.",
+          );
+      } finally {
+        if (active && !exchangingAccess) setChecking(false);
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, []);
+  async function nativeSignedIn() {
+    const current = await authRequest<{
+      authenticated: boolean;
+      auth_mode: AuthMode;
+    }>("/api/session");
+    if (!current.authenticated || current.auth_mode !== "native")
+      throw new Error("Native session unavailable");
+    await createApi("")("/api/agent/init", { method: "POST", body: "{}" });
+    setError("");
+    setSession({ token: "", mode: "native" });
+  }
+  async function signOut() {
+    if (session?.mode === "native") await authRequest("/api/auth/sign-out", {});
+    else if (session?.mode === "access")
+      window.location.assign("/cdn-cgi/access/logout");
+    setSession(null);
+    setDraft("");
+    setError("");
+  }
+  if (session !== null)
     return (
       <Workspace
-        token={token}
-        signOut={() => {
-          setToken("");
-          setDraft("");
-        }}
+        token={session.token}
+        signOut={signOut}
+        authOptions={options}
+      />
+    );
+  if (checking)
+    return (
+      <main className="login">
+        <section className="login-card">
+          <div className="brand-mark">D</div>
+          <h1>DurableClaw</h1>
+          <p role="status">Checking your session…</p>
+        </section>
+      </main>
+    );
+  if (options.enabled)
+    return (
+      <NativeLogin
+        accessRecovery={options.accessRecovery}
+        onAuthenticated={nativeSignedIn}
+        sessionError={error}
       />
     );
   async function signIn(event: FormEvent) {
@@ -31,7 +139,7 @@ export function App() {
     setError("");
     try {
       await createApi(draft)("/api/agent/init", { method: "POST", body: "{}" });
-      setToken(draft);
+      setSession({ token: draft, mode: "token" });
       setDraft("");
     } catch (error) {
       setError(errorText(error));
@@ -72,7 +180,15 @@ export function App() {
     </main>
   );
 }
-function Workspace({ token, signOut }: { token: string; signOut: () => void }) {
+function Workspace({
+  token,
+  signOut,
+  authOptions,
+}: {
+  token: string;
+  signOut: () => Promise<void>;
+  authOptions: AuthOptions;
+}) {
   const api = useMemo(() => createApi(token), [token]);
   const endpoints = useMemo(() => createChatEndpoints(token), [token]);
   const chat = useAgentChat({
@@ -142,19 +258,19 @@ function Workspace({ token, signOut }: { token: string; signOut: () => void }) {
           New conversation
         </button>
         <nav aria-label="Workspace sections">
-          {(["chat", "settings", "memory", "activity"] as Tab[]).map(
-            (value) => (
-              <button
-                className={tab === value ? "selected" : ""}
-                key={value}
-                onClick={() => setTab(value)}
-              >
-                {value === "chat"
-                  ? "Conversations"
-                  : value[0].toUpperCase() + value.slice(1)}
-              </button>
-            ),
-          )}
+          {(
+            ["chat", "settings", "connections", "memory", "activity"] as Tab[]
+          ).map((value) => (
+            <button
+              className={tab === value ? "selected" : ""}
+              key={value}
+              onClick={() => setTab(value)}
+            >
+              {value === "chat"
+                ? "Conversations"
+                : value[0].toUpperCase() + value.slice(1)}
+            </button>
+          ))}
         </nav>
         <div className="conversation-list">
           {chat.conversations.map((conversation) => (
@@ -195,9 +311,15 @@ function Workspace({ token, signOut }: { token: string; signOut: () => void }) {
           )}
         </div>
         <button
-          onClick={() => {
-            chat.reset();
-            signOut();
+          onClick={async () => {
+            try {
+              await signOut();
+              chat.reset();
+            } catch {
+              setActionError(
+                "Sign-out could not be completed. Please try again.",
+              );
+            }
           }}
         >
           Sign out
@@ -330,7 +452,16 @@ function Workspace({ token, signOut }: { token: string; signOut: () => void }) {
             </form>
           </>
         ) : tab === "settings" ? (
-          <Settings api={api} />
+          <Settings
+            api={api}
+            authOptions={authOptions}
+            onSignInAgain={signOut}
+          />
+        ) : tab === "connections" ? (
+          <>
+            <ServiceConnections api={api} />
+            <Connections api={api} conversationId={chat.conversationId} />
+          </>
         ) : tab === "memory" ? (
           <Memories api={api} />
         ) : (
@@ -454,7 +585,15 @@ function ToolResult({
     </details>
   );
 }
-function Settings({ api }: { api: Api }) {
+function Settings({
+  api,
+  authOptions,
+  onSignInAgain,
+}: {
+  api: Api;
+  authOptions: AuthOptions;
+  onSignInAgain: () => Promise<void>;
+}) {
   const [persona, setPersona] = useState<Record<string, any> | null>(null);
   const [error, setError] = useState("");
   const [saved, setSaved] = useState(false);
@@ -633,6 +772,12 @@ function Settings({ api }: { api: Api }) {
         </form>
       ) : (
         !error && <p>Loading settings…</p>
+      )}
+      {authOptions.enabled && (
+        <AccountSecurity
+          accessRecovery={authOptions.accessRecovery}
+          onSignInAgain={onSignInAgain}
+        />
       )}
     </section>
   );

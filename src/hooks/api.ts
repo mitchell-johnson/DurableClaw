@@ -7,8 +7,10 @@ export function createApi(token: string) {
       ...init,
       headers: {
         ...Object.fromEntries(new Headers(init.headers)),
-        Authorization: `Bearer ${token}`,
-        ...(init.body ? { "Content-Type": "application/json" } : {}),
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...(!["GET", "HEAD"].includes((init.method ?? "GET").toUpperCase())
+          ? { "Content-Type": "application/json" }
+          : {}),
       },
     });
     if (!response.ok)

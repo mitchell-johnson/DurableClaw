@@ -6,7 +6,11 @@ import {
   runHousekeepingTasks,
   type HousekeepingTask,
 } from "../../src/durable-objects/assistant/housekeepingBatch";
-import { createBatch, getBatch } from "../../src/utils/openrouterBatch";
+import {
+  createBatch,
+  getBatch,
+  type BatchEnv,
+} from "../../src/utils/openrouterBatch";
 
 vi.mock("../../src/utils/openrouterBatch", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../../src/utils/openrouterBatch")>()),
@@ -20,7 +24,7 @@ vi.mock("../../src/utils/openrouterBatch", async (importOriginal) => ({
 
 afterEach(() => vi.unstubAllGlobals());
 
-function setup() {
+function setup(env: Partial<BatchEnv> = {}) {
   const sql = createSqliteStorage();
   sql.exec(HOUSEKEEPING_SCHEMA_SQL);
   const apply = vi.fn(async () => true);
@@ -30,7 +34,11 @@ function setup() {
   const run = (now: number) =>
     runHousekeepingTasks({
       sql,
-      env: { OPENROUTER_API_KEY: "test", BATCH_MODEL: "example/test:batch" },
+      env: {
+        OPENROUTER_API_KEY: "test",
+        BATCH_MODEL: "example/test:batch",
+        ...env,
+      },
       now,
       apply,
       valid,
@@ -68,6 +76,127 @@ beforeEach(() => {
 });
 
 describe("durable housekeeping batch lifecycle", () => {
+  it("persists pinned inference intent before dispatch and reuses ready output after an application failure", async () => {
+    const t = setup({
+      OPENROUTER_PROVIDER: "google-ai-studio",
+      BATCH_MODEL: "google/gemini-3.8-flash",
+      BACKGROUND_REASONING_EFFORT: "high",
+    });
+    const id = t.queue();
+    const fetcher = vi.fn(async () => {
+      expect(t.arm).toHaveBeenCalled();
+      expect(t.rows()).toEqual([
+        expect.objectContaining({
+          task_id: id,
+          attempts: 1,
+          next_run_at: 300_001,
+        }),
+      ]);
+      return Response.json({
+        choices: [
+          { finish_reason: "stop", message: { content: "Saved result" } },
+        ],
+      });
+    });
+    vi.stubGlobal("fetch", fetcher);
+    t.apply.mockImplementationOnce(async () => {
+      expect(t.rows()).toEqual([
+        expect.objectContaining({
+          state: "ready",
+          result_text: "Saved result",
+        }),
+      ]);
+      throw new Error("Local write interrupted");
+    });
+    await t.run(1);
+    expect(t.rows()).toEqual([
+      expect.objectContaining({
+        state: "ready",
+        result_text: "Saved result",
+        batch_id: null,
+      }),
+    ]);
+    await t.run(600_001);
+    expect(fetcher).toHaveBeenCalledOnce();
+    expect(t.rows()).toHaveLength(0);
+    expect(t.apply).toHaveBeenLastCalledWith(
+      expect.objectContaining({ task_id: id }),
+      "Saved result",
+      expect.any(Function),
+    );
+    expect(createBatch).not.toHaveBeenCalled();
+  });
+
+  it("bounds pinned inference to one task per pass and leaves the rest due without spending attempts", async () => {
+    const t = setup({ OPENROUTER_PROVIDER: "google-ai-studio" });
+    for (let i = 0; i < 25; i++) t.queue(`pinned:${i}`);
+    const fetcher = vi.fn(async () =>
+      Response.json({
+        choices: [{ finish_reason: "stop", message: { content: "Done" } }],
+      }),
+    );
+    vi.stubGlobal("fetch", fetcher);
+    await t.run(1);
+    expect(fetcher).toHaveBeenCalledOnce();
+    expect(t.rows()).toHaveLength(24);
+    expect(
+      t
+        .rows()
+        .every(
+          (row) =>
+            row.state === "queued" &&
+            row.attempts === 0 &&
+            row.next_run_at === 1,
+        ),
+    ).toBe(true);
+    expect(createBatch).not.toHaveBeenCalled();
+  });
+
+  it("does not recreate or apply a pinned task deleted while the model request is in flight", async () => {
+    const t = setup({ OPENROUTER_PROVIDER: "google-ai-studio" });
+    const id = t.queue();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        t.sql.exec("DELETE FROM housekeeping_tasks WHERE task_id = ?", id);
+        return Response.json({
+          choices: [
+            { finish_reason: "stop", message: { content: "Deleted source" } },
+          ],
+        });
+      }),
+    );
+    await t.run(1);
+    expect(t.rows()).toHaveLength(0);
+    expect(t.apply).not.toHaveBeenCalled();
+  });
+
+  it("recovers an interrupted pinned attempt and caps inference retries before the safe fallback", async () => {
+    const t = setup({ OPENROUTER_PROVIDER: "google-ai-studio" });
+    const id = t.queue();
+    // Simulate eviction after persisting intent but before saving a response.
+    t.sql.exec(
+      "UPDATE housekeeping_tasks SET attempts = 1, next_run_at = 300001 WHERE task_id = ?",
+      id,
+    );
+    const fetcher = vi.fn(async () => {
+      throw new Error("Transport interrupted");
+    });
+    vi.stubGlobal("fetch", fetcher);
+    await t.run(1);
+    expect(fetcher).not.toHaveBeenCalled();
+    await t.run(300_001);
+    await t.run(600_001);
+    await t.run(900_001);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(t.apply).toHaveBeenCalledWith(
+      expect.anything(),
+      null,
+      expect.any(Function),
+    );
+    expect(t.rows()).toHaveLength(0);
+  });
+
   it("deduplicates tasks and submits them together without applying pending results", async () => {
     const t = setup();
     const id = t.queue();

@@ -2,6 +2,12 @@
 
 All `/api/agent/*`, `/api/events`, `/api/inbox`, `/api/socket-ticket`, and legacy-import requests require authentication. `/api/health` is public. Cross-origin browser requests are rejected; no wildcard CORS policy is installed.
 
+`GET /api/session` returns `{authenticated:true,auth_mode,principal}` after successful authentication. Access sessions use a verified assertion from the edge; built-in bearer fallback is disabled whenever Access is configured. See [authentication configuration](access-security.md).
+
+Native installations report `auth_mode:"native"` for verified session cookies and also disable bearer fallback. The closed `/api/auth/*` API supports password/passkey sign-in and authenticated credential management; `/api/auth/access` is the only Access bootstrap entry point. See [native sign-in, enrollment and recovery](native-auth.md). Native WebSockets require both a one-use conversation ticket and a current session cookie; alternate upgrade paths are rejected.
+
+The owner-authenticated [messaging management APIs](messaging.md) and [device management APIs](devices-api.md) are separate from machine ingress. Only provider-authenticated `/api/messaging/webhooks/:plugin` and device enrollment/signature endpoints bypass browser authentication. These endpoints cannot approve tools or select an arbitrary owner. The `run_device_bash` tool queues an exact-argument approved job; `list_devices` and `get_device_job` discover targets and read results.
+
 ## HTTP endpoints
 
 | Method / path                                                     | Purpose                                                                                     |
@@ -99,3 +105,9 @@ Custom tools must close over server-resolved identity and conversation state. Ne
 Memory pages use an opaque cursor ordered by creation time and vector ID, and continue to accept old numeric offsets during upgrades. A page reads only its selected local IDs from R2; unavailable or newly hidden records can leave an empty `memories` array with a non-null `next_cursor`. Continue until that cursor is null. Encode memory IDs as URL path components, including IDs containing a colon.
 
 Forget-all hides the local snapshot immediately and may return `202` with `{ "success": true, "pending": true }` while durable inventory discovery and deletion continue. Each deletion pass handles at most 100 IDs. Remote failures retain the scheduled cleanup and do not make forgotten records visible again.
+
+## External service connectors
+
+See [setup, command discovery, approval and recovery](service-connectors.md). Owner routes are `GET /api/connectors`, `POST /api/connectors/google/connect` with selected `services`, authenticated `POST /api/connectors/google/callback`, and `DELETE /api/connectors/:id`. The public callback GET is a bounded popup relay only; it cannot redeem state or tokens. Generated file downloads use `GET /api/connectors/artifacts/:invocation_id/:filename` with owner authentication. No public execute endpoint exists.
+
+The `CONNECTORS` service binding targets the separate Worker's `ConnectorEntrypoint`; signed current-owner context scopes every request. That private service owns `/v1/connections`, `/v1/oauth/start`, `/v1/oauth/callback`, `/v1/catalog`, `/v1/execute`, and `/v1/invocations/:id`. Credentials stay behind that boundary. Model tools are `list_service_connections`, `gog_describe`, `gog_execute`, `get_service_invocation` and the audited Gmail read tools.

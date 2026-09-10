@@ -5,6 +5,7 @@ import {
   batchRequestByteLength,
   batchResultText,
   MAX_BATCH_REQUEST_BYTES,
+  runPinnedHousekeeping,
 } from "../../src/utils/openrouterBatch";
 const env = {
   OPENROUTER_API_KEY: "example-key",
@@ -19,6 +20,74 @@ const request = {
 const reply = (body: unknown) => new Response(JSON.stringify(body));
 afterEach(() => vi.unstubAllGlobals());
 describe("durable batch transport", () => {
+  it("fails closed before new batch submission when provider pinning is configured", async () => {
+    const fetcher = vi.fn();
+    vi.stubGlobal("fetch", fetcher);
+    await expect(
+      createBatch({ ...env, OPENROUTER_PROVIDER: "google-ai-studio" }, [
+        request,
+      ]),
+    ).rejects.toThrow("cannot enforce");
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("runs pinned housekeeping through bounded synchronous inference with the exact model and provider", async () => {
+    const fetcher = vi.fn().mockResolvedValue(
+      reply({
+        choices: [{ finish_reason: "stop", message: { content: "Summary" } }],
+      }),
+    );
+    vi.stubGlobal("fetch", fetcher);
+    expect(
+      await runPinnedHousekeeping(
+        {
+          ...env,
+          BATCH_MODEL: "google/gemini-3.8-flash",
+          OPENROUTER_PROVIDER: "google-ai-studio",
+          BACKGROUND_REASONING_EFFORT: "high",
+        },
+        request,
+      ),
+    ).toBe("Summary");
+    const [url, init] = fetcher.mock.calls[0];
+    expect(url).toBe("https://openrouter.ai/api/v1/chat/completions");
+    expect(JSON.parse(init.body)).toEqual({
+      model: "google/gemini-3.8-flash",
+      messages: [
+        { role: "system", content: request.system },
+        { role: "user", content: request.prompt },
+      ],
+      max_tokens: 100,
+      reasoning: { effort: "high" },
+      provider: { only: ["google-ai-studio"], allow_fallbacks: false },
+      stream: false,
+    });
+    expect(init.signal).toBeInstanceOf(AbortSignal);
+    expect(init.redirect).toBe("manual");
+  });
+
+  it("rejects unsafe pinned housekeeping results and bounds upstream output without exposing it", async () => {
+    const pinned = { ...env, OPENROUTER_PROVIDER: "google-ai-studio" };
+    const fetcher = vi.fn().mockResolvedValue(
+      reply({
+        choices: [{ finish_reason: "length", message: { content: "Partial" } }],
+      }),
+    );
+    vi.stubGlobal("fetch", fetcher);
+    expect(await runPinnedHousekeeping(pinned, request)).toBeNull();
+    fetcher.mockResolvedValue(
+      new Response("x".repeat(MAX_BATCH_REQUEST_BYTES + 1)),
+    );
+    await expect(runPinnedHousekeeping(pinned, request)).rejects.toThrow(
+      "size limit",
+    );
+    fetcher.mockResolvedValue(
+      new Response("private provider error", { status: 500 }),
+    );
+    await expect(runPinnedHousekeeping(pinned, request)).rejects.toThrow(
+      /^OpenRouter housekeeping request failed \(HTTP 500\)$/,
+    );
+  });
   it("resolves configured batch model and counts exactly the UTF-8 body sent", async () => {
     const fetcher = vi
       .fn()
@@ -34,7 +103,7 @@ describe("durable batch transport", () => {
     expect(batchRequestByteLength(requests, env)).toBe(
       new TextEncoder().encode(init.body).byteLength,
     );
-    expect(init.redirect).toBe("error");
+    expect(init.redirect).toBe("manual");
     expect(JSON.parse(init.body)).not.toHaveProperty("provider");
   });
   it("rejects duplicate identifiers, invalid budgets and oversized input before network I/O", async () => {

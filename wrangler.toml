@@ -20,6 +20,10 @@ class_name = "NanoChatAgent"
 name = "RESEARCH_SUBAGENT"
 class_name = "ResearchSubagent"
 
+[[durable_objects.bindings]]
+name = "IDENTITY"
+class_name = "IdentityDO"
+
 [[r2_buckets]]
 binding = "WORKSPACE"
 bucket_name = "durable-claw-workspace"
@@ -39,6 +43,10 @@ new_sqlite_classes = ["NanoChatAgent"]
 tag = "v2"
 new_sqlite_classes = ["ResearchSubagent"]
 
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["IdentityDO"]
+
 [triggers]
 crons = ["* * * * *"]
 
@@ -47,7 +55,15 @@ enabled = true
 head_sampling_rate = 1
 
 [vars]
-CHAT_MODEL = ""
-BACKGROUND_MODEL = ""
-BATCH_MODEL = ""
+CHAT_MODEL = "google/gemini-3.8-flash"
+BACKGROUND_MODEL = "google/gemini-3.8-flash"
+BATCH_MODEL = "google/gemini-3.8-flash"
 PROACTIVE_DISABLED = "false"
+OPENROUTER_PROVIDER = "google-ai-studio"
+BACKGROUND_REASONING_EFFORT = "high"
+
+# Enable after deploying services/connectors and configuring its shared auth secret.
+# [[services]]
+# binding = "CONNECTORS"
+# service = "durable-claw-connectors"
+# entrypoint = "ConnectorEntrypoint"

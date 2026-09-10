@@ -105,27 +105,42 @@ describe("assembled coordinator on native storage", () => {
     );
     expect(right.status).toBe(200);
   });
-  it("allows bodyless DELETE through authenticated routing", async () => {
-    const conversation = "delete-" + crypto.randomUUID();
-    await SELF.fetch("https://example.test/api/agent/init", {
-      method: "POST",
-      headers: auth,
-      body: JSON.stringify({ conversation_id: conversation }),
-    });
-    expect(
-      (
-        await SELF.fetch(
-          `https://example.test/api/agent/conversations/${conversation}`,
-          { method: "DELETE", headers: auth },
-        )
-      ).status,
-    ).toBe(200);
-    const missing = await SELF.fetch(
-      "https://example.test/api/agent/memories/missing",
-      { method: "DELETE", headers: auth },
-    );
-    expect(missing.status).not.toBe(500);
-  });
+  it.each([false, true])(
+    "allows DELETE with an empty streamed body: %s",
+    async (streamed) => {
+      const conversation = "delete-" + crypto.randomUUID();
+      await SELF.fetch("https://example.test/api/agent/init", {
+        method: "POST",
+        headers: auth,
+        body: JSON.stringify({ conversation_id: conversation }),
+      });
+      expect(
+        (
+          await SELF.fetch(
+            `https://example.test/api/agent/conversations/${conversation}`,
+            {
+              method: "DELETE",
+              headers: auth,
+              ...(streamed
+                ? {
+                    body: new ReadableStream({
+                      start(controller) {
+                        controller.close();
+                      },
+                    }),
+                  }
+                : {}),
+            },
+          )
+        ).status,
+      ).toBe(200);
+      const missing = await SELF.fetch(
+        "https://example.test/api/agent/memories/missing",
+        { method: "DELETE", headers: auth },
+      );
+      expect(missing.status).not.toBe(500);
+    },
+  );
   it("uses scoped single-use socket tickets and rejects caller-selected internal callbacks", async () => {
     const rejected = await SELF.fetch(
       "https://example.test/api/agent/subagent-result",

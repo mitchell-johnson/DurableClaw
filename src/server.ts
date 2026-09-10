@@ -1,7 +1,15 @@
 export { NanoChatAgent } from "./durable-objects/NanoChatAgent";
 export { ResearchSubagent } from "./durable-objects/ResearchSubagent";
+export { IdentityDO } from "./identity/IdentityDO";
 import type { Env, AgentPrincipal } from "./types";
 import { authenticate, authorizePrincipal } from "./auth";
+import { accessConfigured } from "./access";
+import {
+  authenticateNative,
+  identityStub,
+  nativeAuthConfigured,
+  routeNativeAuth,
+} from "./nativeAuth";
 import {
   boundedJson,
   validId,
@@ -11,6 +19,16 @@ import {
 import { doName } from "./durable-objects/assistant/principal";
 import { createInternalAuthHeaders } from "./utils/internalAuth";
 import { reconcileWakes } from "./scheduled/wakeReconciler";
+import {
+  handleMessagingOwnerRequest,
+  handleMessagingWebhook,
+} from "./channels/service";
+import { routeDeviceOwner, routeDevicePublic } from "./devices/routes";
+import {
+  isOAuthCallbackRelay,
+  oauthCallbackRelay,
+  routeConnectorOwner,
+} from "./connectors/routes";
 
 const TICKET_TTL_MS = 30_000;
 async function ticketHash(value: string): Promise<string> {
@@ -24,15 +42,23 @@ async function ticketHash(value: string): Promise<string> {
 }
 function sameOrigin(request: Request): boolean {
   const origin = request.headers.get("Origin");
-  return !origin || origin === new URL(request.url).origin;
+  return (
+    request.headers.get("sec-fetch-site") !== "cross-site" &&
+    (!origin || origin === new URL(request.url).origin)
+  );
 }
-async function signedHeaders(p: AgentPrincipal, env: Env) {
+async function signedHeaders(
+  p: AgentPrincipal,
+  env: Env,
+  identitySessionId?: string,
+) {
   return createInternalAuthHeaders(
     {
       userId: p.userId,
       organizationId: p.workspaceId,
       tenantBinding: p.workspaceId,
       role: p.role,
+      ...(identitySessionId ? { identitySessionId } : {}),
     },
     env.INTERNAL_AUTH_SECRET,
   );
@@ -52,14 +78,74 @@ async function ownerStub(env: Env, p: AgentPrincipal) {
 }
 async function routeRequest(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
+  if (
+    request.headers.has("upgrade") &&
+    (url.pathname !== "/api/agent/connect" ||
+      request.method !== "GET" ||
+      request.headers.get("upgrade")?.toLowerCase() !== "websocket")
+  )
+    return Response.json(
+      { error: "Unsupported upgrade route" },
+      { status: 400 },
+    );
   if (url.pathname === "/api/health")
     return Response.json({ status: "ok", service: "durable-claw" });
   if (!url.pathname.startsWith("/api/") && !url.pathname.startsWith("/agents/"))
     return env.ASSETS.fetch(request);
-  if (!sameOrigin(request))
+  if (isOAuthCallbackRelay(request)) return oauthCallbackRelay(request);
+  // Access returns here as a top-level navigation from the identity provider.
+  const accessReturn =
+    url.pathname === "/api/auth/access" && request.method === "GET";
+  if (!accessReturn && !sameOrigin(request))
     return Response.json({ error: "Origin rejected" }, { status: 403 });
   try {
+    const authResponse = await routeNativeAuth(request, env);
+    if (authResponse) return authResponse;
+    if (url.pathname.startsWith("/api/messaging/webhooks/")) {
+      return handleMessagingWebhook(request, env, async (owner, message) => {
+        const principal = await authorizePrincipal(
+          env,
+          owner.userId,
+          owner.workspaceId,
+        );
+        if (principal.role !== "owner") throw new Error("Owner required");
+        const stub = await ownerStub(env, principal);
+        const response = await stub.fetch(
+          "https://agent.internal/channel-message",
+          {
+            method: "POST",
+            headers: await signedHeaders(principal, env),
+            body: JSON.stringify(message),
+            signal: AbortSignal.timeout(100000),
+          },
+        );
+        if (!response.ok) throw new Error("Channel turn unavailable");
+        const reply = await response.json<{ text: string }>();
+        await authorizePrincipal(env, owner.userId, owner.workspaceId);
+        return reply;
+      });
+    }
+    const deviceResponse = await routeDevicePublic(
+      request,
+      env,
+      async (principal) => {
+        const stub = await ownerStub(env, principal);
+        const response = await stub.fetch(
+          "https://agent.internal/device-policy",
+          {
+            headers: await signedHeaders(principal, env),
+            signal: AbortSignal.timeout(5000),
+          },
+        );
+        return (
+          response.ok &&
+          (await response.json<{ allowed: boolean }>()).allowed === true
+        );
+      },
+    );
+    if (deviceResponse) return deviceResponse;
     let p: AgentPrincipal | null = null;
+    let identitySessionId: string | undefined;
     if (
       url.pathname === "/api/agent/connect" &&
       request.headers.get("Upgrade")?.toLowerCase() === "websocket"
@@ -86,12 +172,59 @@ async function routeRequest(request: Request, env: Env): Promise<Response> {
         redeemed.user_id,
         redeemed.workspace_id,
       );
+      if (nativeAuthConfigured(env)) {
+        const reference = await identityStub(env).sessionReference(
+          new Request(request.url, {
+            headers: { cookie: request.headers.get("cookie") || "" },
+          }),
+        );
+        if (reference) identitySessionId = reference.id;
+        else
+          return Response.json(
+            { error: "Current session required" },
+            { status: 401 },
+          );
+      }
     } else p = await authenticate(request, env);
     if (!p)
       return Response.json(
         { error: "Authentication required" },
         { status: 401 },
       );
+    if (
+      (accessConfigured(env) || nativeAuthConfigured(env)) &&
+      !["GET", "HEAD"].includes(request.method) &&
+      !request.headers
+        .get("content-type")
+        ?.toLowerCase()
+        .startsWith("application/json")
+    )
+      return Response.json(
+        { error: "JSON content type required" },
+        { status: 415 },
+      );
+    if (url.pathname === "/api/session" && request.method === "GET")
+      return Response.json({
+        authenticated: true,
+        auth_mode: env.AUTH
+          ? "service"
+          : (await authenticateNative(request, env))
+            ? "native"
+            : accessConfigured(env)
+              ? "access"
+              : "token",
+        principal: p,
+      });
+    const ownerDeviceResponse = await routeDeviceOwner(request, env, p);
+    if (ownerDeviceResponse) return ownerDeviceResponse;
+    const connectorResponse = await routeConnectorOwner(request, env, p);
+    if (connectorResponse) return connectorResponse;
+    const messagingResponse = await handleMessagingOwnerRequest(
+      request,
+      env,
+      p,
+    );
+    if (messagingResponse) return messagingResponse;
     if (url.pathname === "/api/socket-ticket" && request.method === "POST") {
       const data = (await boundedJson(request)) as {
         conversation_id?: unknown;
@@ -228,7 +361,9 @@ async function routeRequest(request: Request, env: Env): Promise<Response> {
       if (!allowed.test(path) && !memoryPath)
         return Response.json({ error: "Not found" }, { status: 404 });
       const stub = await ownerStub(env, p);
-      const headers = new Headers(await signedHeaders(p, env));
+      const headers = new Headers(
+        await signedHeaders(p, env, identitySessionId),
+      );
       if (request.headers.get("Upgrade")?.toLowerCase() === "websocket")
         headers.set("Upgrade", "websocket");
       const target = new URL("https://agent.internal" + (memoryPath ?? path));
@@ -243,11 +378,11 @@ async function routeRequest(request: Request, env: Env): Promise<Response> {
         const v = url.searchParams.get(key);
         if (v !== null) target.searchParams.set(key, v);
       }
-      const body =
-        ["GET", "HEAD"].includes(request.method) ||
-        (!request.body && request.method === "DELETE")
-          ? undefined
-          : JSON.stringify(await boundedJson(request));
+      // These routes have no DELETE payload. At the edge an empty HTTP body
+      // may still be a ReadableStream, so body presence cannot identify it.
+      const body = ["GET", "HEAD", "DELETE"].includes(request.method)
+        ? undefined
+        : JSON.stringify(await boundedJson(request));
       return stub.fetch(
         new Request(target, { method: request.method, headers, body }),
       );
@@ -289,10 +424,11 @@ export default {
     headers.set("X-Content-Type-Options", "nosniff");
     headers.set("X-Frame-Options", "DENY");
     headers.set("Referrer-Policy", "no-referrer");
-    headers.set(
-      "Content-Security-Policy",
-      "default-src 'none'; frame-ancestors 'none'",
-    );
+    if (!isOAuthCallbackRelay(request))
+      headers.set(
+        "Content-Security-Policy",
+        "default-src 'none'; frame-ancestors 'none'",
+      );
     return new Response(response.body, {
       status: response.status,
       statusText: response.statusText,

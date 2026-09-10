@@ -1,15 +1,35 @@
 export interface Env extends Omit<
   Cloudflare.Env,
-  "CHAT_MODEL" | "BACKGROUND_MODEL" | "BATCH_MODEL" | "PROACTIVE_DISABLED"
+  | "CHAT_MODEL"
+  | "BACKGROUND_MODEL"
+  | "BATCH_MODEL"
+  | "PROACTIVE_DISABLED"
+  | "OPENROUTER_PROVIDER"
+  | "BACKGROUND_REASONING_EFFORT"
+  | "IDENTITY"
 > {
   MEMORY_INDEX?: VectorizeIndex;
   DOCUMENT_INDEX?: VectorizeIndex;
   AUTH?: Fetcher;
   AGENT_TOKEN?: string;
+  ACCESS_TEAM_DOMAIN?: string;
+  ACCESS_AUD?: string;
+  ACCESS_OWNER_EMAIL?: string;
+  AUTH_ORIGIN?: string;
+  AUTH_SECRET?: string;
+  IDENTITY?: DurableObjectNamespace<
+    import("../identity/IdentityDO").IdentityDO
+  >;
+  TELEGRAM_BOT_TOKEN?: string;
+  TELEGRAM_WEBHOOK_SECRET?: string;
+  CONNECTORS?: Fetcher;
+  CONNECTOR_AUTH_SECRET?: string;
   INTERNAL_AUTH_SECRET: string;
   MCP_CREDENTIALS_SECRET?: string;
   OPENROUTER_API_KEY?: string;
   OPENROUTER_BASE_URL?: string;
+  OPENROUTER_PROVIDER?: string;
+  BACKGROUND_REASONING_EFFORT?: string;
   CHAT_MODEL: string;
   BACKGROUND_MODEL: string;
   BATCH_MODEL: string;

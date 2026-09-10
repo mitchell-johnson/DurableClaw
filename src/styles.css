@@ -139,6 +139,69 @@ pre {
 .login-card > button {
   width: 100%;
 }
+.native-login form > button {
+  width: 100%;
+}
+.auth-divider {
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+  margin: 1rem 0;
+  color: #9eafbd;
+}
+.auth-divider::before,
+.auth-divider::after {
+  content: "";
+  flex: 1;
+  border-top: 1px solid #344651;
+}
+.auth-recovery,
+.passkey-list li > div {
+  display: grid;
+  gap: 0.4rem;
+}
+.native-login a,
+.account-security a {
+  color: #a4e8db;
+  text-underline-offset: 0.2rem;
+}
+.account-security {
+  border-top: 1px solid #344651;
+  margin-top: 2rem;
+  padding-top: 1rem;
+}
+.account-security fieldset {
+  min-width: 0;
+  margin: 1rem 0;
+  padding: 1rem;
+  border: 1px solid #344651;
+  border-radius: 0.7rem;
+}
+.security-checkbox {
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+}
+.security-checkbox input {
+  width: auto;
+  margin-top: 0.25rem;
+}
+.passkey-settings {
+  margin-top: 2rem;
+}
+.passkey-list {
+  list-style: none;
+  padding: 0;
+}
+.passkey-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.8rem 0;
+  border-bottom: 1px solid #344651;
+  overflow-wrap: anywhere;
+}
 .workspace {
   height: 100dvh;
   display: grid;
@@ -305,6 +368,19 @@ details summary {
   overflow: auto;
   flex: 1;
   padding: 1.5rem max(1.5rem, calc((100% - 48rem) / 2));
+}
+.connections-page pre,
+.connections-page code {
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.connections-page pre {
+  max-height: 24rem;
+  overflow: auto;
+}
+.pairing-code {
+  display: block;
+  user-select: all;
 }
 .settings-page form {
   max-width: 46rem;

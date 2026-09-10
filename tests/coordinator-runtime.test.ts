@@ -3,7 +3,7 @@ import { createMemoryBucket } from "./helpers/memoryBucket";
 import { summarizeConversation } from "../src/durable-objects/assistant/summarizer";
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { tool } from "ai";
-import { z } from "zod";
+import { z } from "zod/v3";
 import { NanoChatAgent } from "../src/durable-objects/NanoChatAgent";
 import { ConversationHistoryStore } from "../src/agent-core/history";
 import { replayHistory } from "../src/agent-core/replay";

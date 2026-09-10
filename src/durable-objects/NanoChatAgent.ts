@@ -23,6 +23,14 @@ import {
 } from "../services/proactive/budget";
 import { createMcpTool } from "./assistant/mcpTool";
 import { authorizePrincipal } from "../auth";
+import { nativeAuthConfigured } from "../nativeAuth";
+import { createDeviceTools } from "../devices/tools";
+import { createConnectorTools } from "../connectors/tools";
+import { computeArgsHash } from "../action-library/confirmations";
+import {
+  claimChannelRequest,
+  completeChannelRequest,
+} from "./assistant/channelRequests";
 import {
   exportLegacyPage,
   importLegacyPage,
@@ -34,6 +42,7 @@ import {
   validMemoryId,
   jsonObject,
   RequestValidationError,
+  boundedJson,
 } from "../utils/validation";
 import { type ModelMessage, type ToolSet } from "ai";
 import { SpanStatusCode, type Tracer } from "@opentelemetry/api";
@@ -204,6 +213,7 @@ import {
   validateInternalAuth,
   requireInternalAuth,
   readInternalAuth,
+  validIdentitySessionId,
   INTERNAL_AUTH_MIGRATION_WINDOW,
 } from "../utils/internalAuth";
 import { CHAT_MODEL } from "../config";
@@ -608,8 +618,11 @@ export class NanoChatAgent implements DurableObject {
     WebSocket,
     {
       conversation_id: string;
+      identitySessionId?: string;
     }
   > = new Map();
+  private socketSendQueue = new WeakMap<WebSocket, Promise<void>>();
+  private unauthorizedSockets = new WeakSet<WebSocket>();
   private systemPrompt: string | null = null;
   private cachedPermissions: UserPermission[] | null = null;
   private mcpToolCache: Map<string, MCPTool[]> = new Map();
@@ -893,9 +906,40 @@ CREATE TABLE IF NOT EXISTS context (
       now,
     );
   }
-  private sendWS(ws: WebSocket, message: Record<string, unknown>): void {
+  private sendWS(ws: WebSocket | null, message: Record<string, unknown>): void {
+    if (!ws) return;
+    const ctx = this.socketContext.get(ws) ?? this.rehydrateSocketContext(ws);
+    if (this.unauthorizedSockets.has(ws)) return;
+    if (nativeAuthConfigured(this.env) && !ctx?.identitySessionId) {
+      this.closeUnauthorizedSocket(ws);
+      return;
+    }
+    const payload = JSON.stringify(message);
+    if (ctx?.identitySessionId) {
+      // Preserve history/delta ordering while checking authority immediately
+      // before every native-session frame, including background broadcasts.
+      const previous = this.socketSendQueue.get(ws) ?? Promise.resolve();
+      const send = previous
+        .then(async () => {
+          if (
+            ws.readyState === WebSocket.OPEN &&
+            (await this.socketSessionActive(ws))
+          )
+            ws.send(payload);
+        })
+        .catch(() => {
+          this.closeUnauthorizedSocket(ws);
+        });
+      const tracked = send.finally(() => {
+        if (this.socketSendQueue.get(ws) === tracked)
+          this.socketSendQueue.delete(ws);
+      });
+      this.socketSendQueue.set(ws, tracked);
+      this.state.waitUntil(tracked);
+      return;
+    }
     try {
-      ws.send(JSON.stringify(message));
+      ws.send(payload);
     } catch (error) {
       logError("Failed to send WebSocket message", error as Error, {
         "do.name": "NanoChatAgent",
@@ -906,14 +950,13 @@ CREATE TABLE IF NOT EXISTS context (
     conversationId: string,
     message: Record<string, unknown>,
   ): void {
-    const messageStr = JSON.stringify(message);
     const sockets = this.state.getWebSockets();
     for (const ws of sockets) {
       const ctx = this.socketContext.get(ws) ?? this.rehydrateSocketContext(ws);
       if (ctx?.conversation_id !== conversationId) continue;
       try {
         if (ws.readyState === WebSocket.OPEN) {
-          ws.send(messageStr);
+          this.sendWS(ws, message);
         }
       } catch (err) {
         logDebug("Failed to send to WebSocket during conversation broadcast", {
@@ -923,17 +966,70 @@ CREATE TABLE IF NOT EXISTS context (
       }
     }
   }
+  private closeUnauthorizedSocket(ws: WebSocket): void {
+    if (this.unauthorizedSockets.has(ws)) return;
+    this.unauthorizedSockets.add(ws);
+    try {
+      ws.close(1008, "Session no longer authorized");
+    } catch {}
+  }
+  private async identitySessionActive(id: string): Promise<boolean> {
+    if (!validIdentitySessionId(id) || !this.env.IDENTITY) return false;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const identity = this.env.IDENTITY.get(
+        this.env.IDENTITY.idFromName("owner/default"),
+      );
+      return await Promise.race([
+        identity.sessionActive(id).then((active) => active === true),
+        new Promise<boolean>((resolve) => {
+          timeout = setTimeout(() => resolve(false), 5_000);
+        }),
+      ]);
+    } catch {
+      return false;
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout);
+    }
+  }
+  private async socketSessionActive(ws: WebSocket): Promise<boolean> {
+    if (this.unauthorizedSockets.has(ws)) return false;
+    const ctx = this.socketContext.get(ws) ?? this.rehydrateSocketContext(ws);
+    if (this.unauthorizedSockets.has(ws)) return false;
+    if (!ctx?.identitySessionId) {
+      if (!nativeAuthConfigured(this.env)) return true;
+      this.closeUnauthorizedSocket(ws);
+      return false;
+    }
+    if (await this.identitySessionActive(ctx.identitySessionId)) return true;
+    this.closeUnauthorizedSocket(ws);
+    return false;
+  }
   private rehydrateSocketContext(ws: WebSocket):
     | {
         conversation_id: string;
+        identitySessionId?: string;
       }
     | undefined {
     try {
       const attachment = (ws as any).deserializeAttachment() as {
         conversation_id?: string;
+        identitySessionId?: unknown;
       } | null;
+      if (
+        attachment?.identitySessionId !== undefined &&
+        !validIdentitySessionId(attachment.identitySessionId)
+      ) {
+        this.closeUnauthorizedSocket(ws);
+        return undefined;
+      }
       if (attachment?.conversation_id) {
-        const ctx = { conversation_id: attachment.conversation_id };
+        const ctx = {
+          conversation_id: attachment.conversation_id,
+          ...(attachment.identitySessionId === undefined
+            ? {}
+            : { identitySessionId: attachment.identitySessionId as string }),
+        };
         this.socketContext.set(ws, ctx);
         return ctx;
       }
@@ -1151,6 +1247,20 @@ CREATE TABLE IF NOT EXISTS context (
         ? createMemoryRetrievalTool(retrievalContext, { sql: this.sql })
         : {};
     const merged: Record<string, unknown> = {
+      ...createConnectorTools({
+        env: this.env,
+        sql: this.sql,
+        context: this.context,
+        conversationId,
+        signal,
+      }),
+      ...createDeviceTools({
+        env: this.env,
+        sql: this.sql,
+        context: this.context,
+        conversationId,
+        signal,
+      }),
       ...createWorkspaceTools({
         env: this.env,
         sql: this.sql,
@@ -1490,6 +1600,23 @@ CREATE TABLE IF NOT EXISTS context (
     if (url.pathname === "/init" && request.method === "POST") {
       return this.handleInit(request);
     }
+    if (url.pathname === "/channel-message" && request.method === "POST") {
+      return this.handleChannelMessage(request);
+    }
+    if (url.pathname === "/device-policy" && request.method === "GET") {
+      try {
+        if (!this.context) throw new Error("Not initialized");
+        const principal = await authorizePrincipal(
+          this.env,
+          this.context.user_id,
+          this.context.tenant_binding,
+        );
+        this.assertToolAvailable("run_device_bash");
+        return Response.json({ allowed: principal.role === "owner" });
+      } catch {
+        return Response.json({ allowed: false });
+      }
+    }
     if (url.pathname === "/persona") {
       return this.handlePersona(request);
     }
@@ -1585,12 +1712,134 @@ CREATE TABLE IF NOT EXISTS context (
     if (convMatch && !convMatch[2] && request.method === "DELETE") {
       return this.handleDeleteConversation(convMatch[1]);
     }
-    if (request.headers.get("Upgrade") === "websocket") {
-      return this.handleWebSocketUpgrade(url);
+    if (
+      request.headers.get("Upgrade") === "websocket" &&
+      url.pathname === "/connect" &&
+      request.method === "GET"
+    ) {
+      if (
+        (nativeAuthConfigured(this.env) && !identity.identitySessionId) ||
+        (identity.identitySessionId &&
+          !(await this.identitySessionActive(identity.identitySessionId)))
+      )
+        return Response.json({ error: "Unauthorized" }, { status: 401 });
+      return this.handleWebSocketUpgrade(url, identity.identitySessionId);
     }
     return new Response("Expected WebSocket or known endpoint", {
       status: 400,
     });
+  }
+  private async handleChannelMessage(request: Request): Promise<Response> {
+    let data: Record<string, unknown>;
+    try {
+      data = jsonObject(await boundedJson(request));
+    } catch {
+      return Response.json(
+        { error: "Invalid channel message" },
+        { status: 400 },
+      );
+    }
+    const { conversationId, requestId, content } = data;
+    if (
+      !validId(conversationId) ||
+      !validId(requestId) ||
+      typeof content !== "string" ||
+      !content.trim() ||
+      content.length > 32000
+    )
+      return Response.json(
+        { error: "Invalid channel message" },
+        { status: 400 },
+      );
+    try {
+      if (!this.context) throw new Error("Not initialized");
+      const p = await authorizePrincipal(
+        this.env,
+        this.context.user_id,
+        this.context.tenant_binding,
+      );
+      if (p.role !== "owner") throw new Error("Owner required");
+    } catch {
+      return Response.json(
+        { error: "Current authority unavailable" },
+        { status: 403 },
+      );
+    }
+    const hash = await computeArgsHash({ conversationId, content });
+    const claim = claimChannelRequest(
+      this.sql,
+      requestId,
+      conversationId,
+      hash,
+    );
+    if (claim.status === "complete") return Response.json({ text: claim.text });
+    if (claim.status === "conflict")
+      return Response.json(
+        {
+          error:
+            "Delivery is already claimed or has changed. Inspect the conversation before retrying.",
+        },
+        { status: 409 },
+      );
+    this.ensureConversationRow(conversationId);
+    // This preflight and entry into handleUserMessage are synchronous relative
+    // to other messages. A rejected turn is retained, never reported as run.
+    if (
+      this.processingConversations.has(conversationId) ||
+      this.pendingMessages.has(conversationId) ||
+      Date.now() - (this.lastMessageAt.get(conversationId) ?? 0) < RATE_LIMIT_MS
+    ) {
+      const text =
+        "Your message was saved but not executed because this conversation is busy or receiving messages too quickly. After the current response finishes, ask me to continue with the saved message.";
+      const userId = this.appendMessage({
+        conversationId,
+        role: "user",
+        content,
+      });
+      const replyId = this.appendMessage({
+        conversationId,
+        role: "assistant",
+        content: text,
+      });
+      this.sendToConversation(conversationId, {
+        type: "history_user_message",
+        content,
+        message_id: userId,
+      });
+      this.sendToConversation(conversationId, {
+        type: "assistant_message",
+        content: text,
+        message_id: replyId,
+      });
+      completeChannelRequest(this.sql, requestId, text);
+      return Response.json({ text });
+    }
+    const text =
+      (await this.handleUserMessage(
+        null,
+        conversationId,
+        content,
+        undefined,
+        requestId,
+        90000,
+      )) ??
+      "This turn did not complete. Open the DurableClaw conversation to inspect its status before retrying.";
+    const pending =
+      this.sql
+        .exec(
+          "SELECT confirmation_id FROM tool_confirmations WHERE conversation_id=? AND status='pending' AND expires_at>? LIMIT 1",
+          conversationId,
+          Date.now(),
+        )
+        .toArray().length > 0;
+    const reply = (
+      text +
+      (pending
+        ? "\n\nApproval is required in the DurableClaw web app. Open this conversation to review the exact action; replying in this chat cannot approve it."
+        : "")
+    ).slice(0, 16000);
+    completeChannelRequest(this.sql, requestId, reply);
+    return Response.json({ text: reply });
   }
   private static sanitizeAdvisoryPage(raw: unknown): {
     path?: string;
@@ -2682,6 +2931,20 @@ CREATE TABLE IF NOT EXISTS context (
     confirmationId: string,
     request: Request,
   ): Promise<Response> {
+    try {
+      if (!this.context) throw new Error("Not initialized");
+      const principal = await authorizePrincipal(
+        this.env,
+        this.context.user_id,
+        this.context.tenant_binding,
+      );
+      if (principal.role !== "owner") throw new Error("Owner required");
+    } catch {
+      return Response.json(
+        { error: "Owner permission required" },
+        { status: 403 },
+      );
+    }
     if (!this.getConversationRow(conversationId)) {
       return Response.json(
         { error: "Conversation not found" },
@@ -2738,7 +3001,10 @@ CREATE TABLE IF NOT EXISTS context (
       status: body.decision === "confirmed" ? "approved" : "declined",
     });
   }
-  private handleWebSocketUpgrade(url: URL): Response {
+  private handleWebSocketUpgrade(
+    url: URL,
+    identitySessionId?: string,
+  ): Response {
     const conversationId = url.searchParams.get("conversation_id");
     if (!validId(conversationId)) {
       return new Response("Missing conversation_id query param", {
@@ -2757,8 +3023,12 @@ CREATE TABLE IF NOT EXISTS context (
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
     this.state.acceptWebSocket(server);
-    (server as any).serializeAttachment({ conversation_id: conversationId });
-    this.socketContext.set(server, { conversation_id: conversationId });
+    const socketContext = {
+      conversation_id: conversationId,
+      ...(identitySessionId ? { identitySessionId } : {}),
+    };
+    server.serializeAttachment(socketContext);
+    this.socketContext.set(server, socketContext);
     logInfo("NanoChatAgent WebSocket connected", {
       "do.name": "NanoChatAgent",
       "conversation.id": conversationId,
@@ -3111,6 +3381,7 @@ CREATE TABLE IF NOT EXISTS context (
     ws: WebSocket,
     message: string | ArrayBuffer,
   ): Promise<void> {
+    if (!(await this.socketSessionActive(ws))) return;
     if (
       (typeof message === "string"
         ? new TextEncoder().encode(message).length
@@ -3250,18 +3521,24 @@ CREATE TABLE IF NOT EXISTS context (
     }
   }
   async webSocketClose(ws: WebSocket): Promise<void> {
+    this.unauthorizedSockets.add(ws);
     this.socketContext.delete(ws);
+    this.socketSendQueue.delete(ws);
+    try {
+      ws.close();
+    } catch {}
     logDebug("NanoChatAgent WebSocket disconnected", {
       "do.name": "NanoChatAgent",
     });
   }
   private async handleUserMessage(
-    ws: WebSocket,
+    ws: WebSocket | null,
     conversationId: string,
     content: string,
     rawPageContext?: unknown,
     rawRequestId?: unknown,
-  ): Promise<void> {
+    deadlineMs?: number,
+  ): Promise<string | undefined> {
     if (!this.context) {
       this.sendWS(ws, {
         type: "error",
@@ -3314,6 +3591,12 @@ CREATE TABLE IF NOT EXISTS context (
       stopped: false,
     };
     this.activeTurns.set(conversationId, activeTurn);
+    const deadline = deadlineMs
+      ? setTimeout(() => {
+          if (this.activeTurns.get(conversationId) === activeTurn)
+            this.handleCancelTurn(conversationId, requestId);
+        }, deadlineMs)
+      : undefined;
     let persistedMessages = 0;
     let lastAssistantMessageId: string | null = null;
     const journaledTools = new Map<
@@ -3379,7 +3662,17 @@ CREATE TABLE IF NOT EXISTS context (
       const beforeCount =
         this.getConversationRow(conversationId)?.message_count ?? 0;
       const isFirstMessage = beforeCount === 0;
-      this.appendMessage({ conversationId, role: "user", content });
+      const userMessageId = this.appendMessage({
+        conversationId,
+        role: "user",
+        content,
+      });
+      if (!ws)
+        this.sendToConversation(conversationId, {
+          type: "history_user_message",
+          content,
+          message_id: userMessageId,
+        });
       if (isFirstMessage) {
         this.maybeSetTitle(conversationId, content);
       }
@@ -3611,6 +3904,7 @@ CREATE TABLE IF NOT EXISTS context (
           ? { "agent.reasoning_effort": personaSettings.reasoningEffort }
           : {}),
       });
+      return fullText;
     } catch (error) {
       if (activeTurn.controller.signal.aborted) return;
       span.setStatus({ code: SpanStatusCode.ERROR });
@@ -3679,6 +3973,7 @@ CREATE TABLE IF NOT EXISTS context (
         });
       }
     } finally {
+      if (deadline !== undefined) clearTimeout(deadline);
       if (this.activeTurns.get(conversationId) === activeTurn) {
         this.activeTurns.delete(conversationId);
         this.processingConversations.delete(conversationId);

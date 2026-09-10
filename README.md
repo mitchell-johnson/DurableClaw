@@ -14,6 +14,9 @@ One coordinator object owns a user's conversations within a workspace. Independe
 - Opt-in proactive checks with event cursors, deduplication, daily budgets, a zero-model quiet path, research synthesis, and a durable inbox.
 - Server-issued, argument-bound approvals for file mutations and remote MCP tools. Configurable persona, response depth, tool policy, and encrypted MCP credentials.
 - Invocation-owned OpenTelemetry exports, including cold alarms, with bounded buffering and flushing.
+- Extensible messaging plugins with Telegram private-chat linking, authenticated webhooks, replay protection, and shared conversation history.
+- Multiple paired Macs through an installable user service: outbound signed HTTPS, revocable device keys, and exact-command Bash approvals in the web app.
+- Always-on Google Workspace connectors with gogcli command discovery, approved read/write operations, private file transfers and a separate encrypted credential vault.
 
 See [architecture](ARCHITECTURE.md), [API and integration contracts](docs/api.md), [runtime guarantees](docs/runtime.md), and [upgrading existing installations](docs/upgrading.md).
 
@@ -28,17 +31,19 @@ cp .dev.vars.example .dev.vars
 
 Set these values in `.dev.vars`:
 
-| Setting                  | Purpose                                                              |
-| ------------------------ | -------------------------------------------------------------------- |
-| `AGENT_TOKEN`            | A long random bearer token for the default single-owner installation |
-| `INTERNAL_AUTH_SECRET`   | A separate random secret signing internal object requests            |
-| `OPENROUTER_API_KEY`     | Model and batch API access                                           |
-| `CHAT_MODEL`             | Tool-capable foreground model ID                                     |
-| `BACKGROUND_MODEL`       | Tool-capable background research model ID                            |
-| `BATCH_MODEL`            | Model ID supported by the OpenRouter Batch API                       |
-| `MCP_CREDENTIALS_SECRET` | A separate random secret when storing MCP credentials                |
+| Setting                       | Purpose                                                              |
+| ----------------------------- | -------------------------------------------------------------------- |
+| `AGENT_TOKEN`                 | A long random bearer token for the default single-owner installation |
+| `INTERNAL_AUTH_SECRET`        | A separate random secret signing internal object requests            |
+| `OPENROUTER_API_KEY`          | OpenRouter model API access                                          |
+| `CHAT_MODEL`                  | Tool-capable foreground model ID                                     |
+| `BACKGROUND_MODEL`            | Tool-capable background research model ID                            |
+| `BATCH_MODEL`                 | Housekeeping model; uses synchronous DO requests when pinned         |
+| `OPENROUTER_PROVIDER`         | Optional exact provider slug, with fallback providers disabled       |
+| `BACKGROUND_REASONING_EFFORT` | Background reasoning level supported by the selected model           |
+| `MCP_CREDENTIALS_SECRET`      | A separate random secret when storing MCP credentials                |
 
-Generate random secrets locally, for example with `openssl rand -hex 32`. Model IDs are deliberately deployment settings; verify tool support and batch availability for the IDs you choose. Foreground response depth is user-controlled; background calls default to maximum reasoning unless explicitly set otherwise.
+Generate random secrets locally, for example with `openssl rand -hex 32`. Model IDs are deployment settings; verify tool support and provider availability for the IDs you choose. The current configuration selects `google/gemini-3.8-flash` through `google-ai-studio` and sets background reasoning to `high`. Pinned housekeeping executes in the Durable Object because OpenRouter's Batch API cannot enforce provider preferences. Foreground response depth remains user-controlled.
 
 ```sh
 npx wrangler d1 migrations apply durable-claw-control --local
@@ -108,6 +113,14 @@ npm run deploy
 
 The default token intentionally represents one owner in one workspace. For multiple users, attach an `AUTH` service binding implementing the [authentication contract](docs/api.md#authentication-service). Identity comes from authentication; the public API does not accept caller-selected owner or workspace IDs.
 
+For production device access, use the built-in [Cloudflare Access authentication](docs/access-security.md). The browser automatically recognizes its Access session. Device keys authorize only device traffic; they never grant owner administration or approval access.
+
+For direct email/password and passkey sign-in, enable [native authentication](docs/native-auth.md). Credentials and sessions stay in a dedicated Durable Object. Initial setup uses the verified owner’s GitHub login; a recent passkey login can recover a password.
+
+Apply the new D1 migrations, then use **Connections** in the web app to link Telegram to your current conversation and create a private pairing code for each Mac. Follow [Telegram setup and plugin authoring](docs/messaging.md) and [Mac installation](docs/device-daemon.md). The daemon requires Node.js 22.12 or newer and runs as the logged-in user. Bash has that user's full permissions, and each execution needs web approval. See [device APIs and recovery semantics](docs/devices-api.md).
+
+Connect Gmail and other Google services through the [external service connector setup](docs/service-connectors.md). A native TypeScript port of gogcli runs entirely inside a credential Durable Object, which owns OAuth and invocation recovery. Generic commands require exact web approval.
+
 The included retrieval adapter is scoped to private workspace files. Implement `RetrievalAdapter` to connect application records, retaining authorization before reranking and hydration. Implement observers and inbox publication for your application through the documented interfaces. Remote MCP tools are optional and require explicit approval for execution.
 
 ## Development checks
@@ -115,6 +128,7 @@ The included retrieval adapter is scoped to private workspace files. Implement `
 ```sh
 npm run check
 npm test
+npm run test:device
 npm run test:workers
 npm run build
 npm audit

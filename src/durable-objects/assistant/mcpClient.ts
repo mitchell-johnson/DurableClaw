@@ -323,7 +323,7 @@ async function jsonRpcRequest(
   try {
     const response = await connection.fetchImpl(connection.url.href, {
       method: "POST",
-      redirect: "error",
+      redirect: "manual",
       headers: connectionHeaders(connection),
       body: JSON.stringify({
         jsonrpc: "2.0",
@@ -383,7 +383,7 @@ async function closeSession(connection: Connection): Promise<void> {
   try {
     const response = await connection.fetchImpl(connection.url.href, {
       method: "DELETE",
-      redirect: "error",
+      redirect: "manual",
       headers: connectionHeaders(connection),
       signal: AbortSignal.timeout(Math.min(1000, remaining)),
     });

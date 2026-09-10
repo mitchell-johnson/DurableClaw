@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { tool } from "ai";
-import { z } from "zod";
+import { z } from "zod/v3";
 import { CHAT_MODEL } from "../../src/config";
 import { runToolLoop } from "../../src/action-library/loop";
 import { OpenRouterToolReplay } from "../../src/action-library/openrouterReplay";

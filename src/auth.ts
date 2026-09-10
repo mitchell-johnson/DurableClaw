@@ -1,5 +1,11 @@
 import type { Env, AgentPrincipal } from "./types";
 import { validId } from "./utils/validation";
+import { accessConfigured, accessSettings, authenticateAccess } from "./access";
+import {
+  authenticateNative,
+  identityStub,
+  nativeAuthConfigured,
+} from "./nativeAuth";
 export async function constantTimeEqual(
   a: string,
   b: string,
@@ -45,11 +51,19 @@ export async function authenticate(
         headers: {
           authorization: request.headers.get("authorization") || "",
           cookie: request.headers.get("cookie") || "",
+          "cf-access-jwt-assertion":
+            request.headers.get("cf-access-jwt-assertion") || "",
         },
       }),
     );
     return response.ok ? principal(await response.json()) : null;
   }
+  if (nativeAuthConfigured(env)) {
+    const session = await authenticateNative(request, env);
+    if (session) return session;
+    return accessConfigured(env) ? authenticateAccess(request, env) : null;
+  }
+  if (accessConfigured(env)) return authenticateAccess(request, env);
   const token = request.headers.get("authorization")?.replace(/^Bearer /i, "");
   return token &&
     env.AGENT_TOKEN &&
@@ -74,7 +88,15 @@ export async function authorizePrincipal(
       throw new Error("Current authority unavailable");
     return p;
   }
-  if (!env.AGENT_TOKEN || userId !== "owner" || workspaceId !== "default")
+  if (accessConfigured(env) && !nativeAuthConfigured(env)) accessSettings(env);
+  if (nativeAuthConfigured(env)) identityStub(env);
+  if (
+    (!nativeAuthConfigured(env) &&
+      !accessConfigured(env) &&
+      !env.AGENT_TOKEN) ||
+    userId !== "owner" ||
+    workspaceId !== "default"
+  )
     throw new Error("Current authority unavailable");
   return { userId, workspaceId, role: "owner" };
 }

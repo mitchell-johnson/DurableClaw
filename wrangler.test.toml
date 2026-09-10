@@ -9,9 +9,12 @@ class_name = "NanoChatAgent"
 [[durable_objects.bindings]]
 name = "RESEARCH_SUBAGENT"
 class_name = "ResearchSubagent"
+[[durable_objects.bindings]]
+name = "IDENTITY"
+class_name = "IdentityDO"
 [[migrations]]
 tag = "v1"
-new_sqlite_classes = ["NanoChatAgent", "ResearchSubagent"]
+new_sqlite_classes = ["NanoChatAgent", "ResearchSubagent", "IdentityDO"]
 [[r2_buckets]]
 binding = "WORKSPACE"
 bucket_name = "test-workspace"

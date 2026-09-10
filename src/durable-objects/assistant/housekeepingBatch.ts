@@ -1,6 +1,7 @@
-/** Durable outbox for DurableClaw's deferred model work. No model call waits for inference. */
+/** Durable outbox for deferred model work, including strictly pinned inference. */
 import {
   createBatch,
+  runPinnedHousekeeping,
   getBatch,
   batchResultText,
   isBatchTerminal,
@@ -10,6 +11,7 @@ import {
   type BatchRequest,
   type BatchEnv,
 } from "../../utils/openrouterBatch";
+import { openRouterProvider } from "../../utils/openrouterRouting";
 import type { SqlExecLike } from "./memory";
 import { logWarn } from "../../telemetry/logger";
 
@@ -146,6 +148,7 @@ export async function runHousekeepingTasks(args: {
   arm: (at: number) => Promise<void>;
 }): Promise<void> {
   const { sql, now } = args;
+  const pinned = Boolean(openRouterProvider(args.env));
   // A full 500-task backlog can contain hundreds of MB of prompts/sources.
   // Inspect scheduling metadata first; only selected tasks load their bodies.
   const rows = sql
@@ -217,7 +220,7 @@ export async function runHousekeepingTasks(args: {
   let requests: BatchRequest[] = [];
   for (const metadata of [...pending.values()]
     .filter((t) => t.state === "queued")
-    .slice(0, MAX_BATCH_REQUESTS)) {
+    .slice(0, pinned ? 1 : MAX_BATCH_REQUESTS)) {
     const task = load(metadata);
     if (!task) {
       pending.delete(metadata.task_id);
@@ -310,32 +313,39 @@ export async function runHousekeepingTasks(args: {
         task.task_id,
       );
     try {
-      const batch = await createBatch(args.env, requests);
-      for (const task of queued) {
-        if (!live(task)) {
-          drop(task);
-          continue;
+      if (pinned) {
+        const task = queued[0];
+        const text = await runPinnedHousekeeping(args.env, requests[0]);
+        if (!live(task)) drop(task);
+        else markReady(pending.get(task.task_id)!, text);
+      } else {
+        const batch = await createBatch(args.env, requests);
+        for (const task of queued) {
+          if (!live(task)) {
+            drop(task);
+            continue;
+          }
+          // Some providers can finish before submission returns.
+          const terminal = isBatchTerminal(batch.status);
+          task.state = terminal ? "ready" : "submitted";
+          task.result_text = terminal
+            ? batchResultText(batch, task.task_id)
+            : null;
+          const metadata = pending.get(task.task_id)!;
+          metadata.state = task.state;
+          metadata.batch_id = batch.id;
+          sql.exec(
+            "UPDATE housekeeping_tasks SET state = ?, batch_id = ?, result_text = ? WHERE task_id = ?",
+            task.state,
+            batch.id,
+            task.result_text,
+            task.task_id,
+          );
         }
-        // Some providers can finish before submission returns.
-        const terminal = isBatchTerminal(batch.status);
-        task.state = terminal ? "ready" : "submitted";
-        task.result_text = terminal
-          ? batchResultText(batch, task.task_id)
-          : null;
-        const metadata = pending.get(task.task_id)!;
-        metadata.state = task.state;
-        metadata.batch_id = batch.id;
-        sql.exec(
-          "UPDATE housekeeping_tasks SET state = ?, batch_id = ?, result_text = ? WHERE task_id = ?",
-          task.state,
-          batch.id,
-          task.result_text,
-          task.task_id,
-        );
       }
     } catch {
       logWarn(
-        "DurableClaw housekeeping batch submission failed; retry scheduled",
+        "DurableClaw housekeeping inference submission failed; retry scheduled",
         { "durableclaw.batch.request_count": queued.length },
       );
     }

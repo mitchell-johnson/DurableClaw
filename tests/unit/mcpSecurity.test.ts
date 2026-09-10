@@ -45,7 +45,7 @@ describe("MCP trust boundary", () => {
       decryptedHeaders: { Authorization: "Bearer test-token" },
       fetchImpl,
     });
-    expect(fetchImpl.mock.calls[0][1].redirect).toBe("error");
+    expect(fetchImpl.mock.calls[0][1].redirect).toBe("manual");
   });
   it("caps chunked response bytes and excludes upstream secrets from errors", async () => {
     const fetchImpl = vi
