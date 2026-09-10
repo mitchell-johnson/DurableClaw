@@ -32,6 +32,127 @@ interface Link {
   conversation_id: string;
 }
 
+interface LinkedRequest extends Link {
+  delivery_status: string;
+  delivery_updated_at: number;
+}
+
+/** Resolve only the link that accepted this request, never a replacement link
+ * or a different conversation belonging to the same owner. */
+async function linkedRequest(
+  env: MessagingEnv,
+  principal: AgentPrincipal,
+  conversationId: string,
+  requestId: string,
+): Promise<LinkedRequest | null> {
+  if (principal.role !== "owner") return null;
+  return env.CONTROL_DB.prepare(
+    `SELECT l.*, d.status AS delivery_status, d.updated_at AS delivery_updated_at
+     FROM messaging_deliveries d JOIN messaging_links l ON l.id=d.link_id
+     WHERE d.request_id=? AND d.user_id=? AND d.workspace_id=? AND d.expires_at>?
+       AND l.user_id=d.user_id AND l.workspace_id=d.workspace_id
+       AND l.plugin_id=d.plugin_id AND l.conversation_id=?`,
+  )
+    .bind(
+      requestId,
+      principal.userId,
+      principal.workspaceId,
+      Date.now(),
+      conversationId,
+    )
+    .first<LinkedRequest>();
+}
+
+export async function sendLinkedTyping(
+  env: MessagingEnv,
+  principal: AgentPrincipal,
+  conversationId: string,
+  requestId: string,
+  signal: AbortSignal,
+  registry: MessagingRegistry = messagingRegistry,
+): Promise<boolean> {
+  signal.throwIfAborted();
+  const link = await linkedRequest(env, principal, conversationId, requestId);
+  signal.throwIfAborted();
+  const plugin = link ? registry.get(link.plugin_id) : undefined;
+  if (!link || !plugin?.sendTyping || !plugin.configured(env)) return false;
+  await plugin.sendTyping(env, { chatId: link.chat_id }, signal);
+  return true;
+}
+
+/** A later, persisted assistant message has its own durable delivery claim.
+ * Retry preparation freely, but never repeat an ambiguous sendMessage call. */
+export async function sendLinkedReply(
+  env: MessagingEnv,
+  principal: AgentPrincipal,
+  reply: {
+    conversationId: string;
+    requestId: string;
+    messageId: string;
+    text: string;
+  },
+  registry: MessagingRegistry = messagingRegistry,
+): Promise<"done" | "pending"> {
+  const link = await linkedRequest(
+    env,
+    principal,
+    reply.conversationId,
+    reply.requestId,
+  );
+  const plugin = link ? registry.get(link.plugin_id) : undefined;
+  if (!link || !plugin?.configured(env)) return "done";
+  // Keep the initial acknowledgment ahead of a quick batch result. A crashed
+  // webhook must not hold the result forever (host deadline is 100 seconds).
+  if (
+    ["processing", "sending"].includes(link.delivery_status) &&
+    link.delivery_updated_at > Date.now() - 110_000
+  )
+    return "pending";
+  const digest = await hash(JSON.stringify([reply.requestId, reply.messageId]));
+  const requestId = `reply_${digest}`;
+  const now = Date.now();
+  const claim = await env.CONTROL_DB.prepare(
+    "INSERT OR IGNORE INTO messaging_deliveries(request_id,event_id,link_id,user_id,workspace_id,plugin_id,status,created_at,updated_at,expires_at) SELECT ?,?,?,?,?,?,'sending',?,?,? WHERE EXISTS(SELECT 1 FROM messaging_links WHERE id=?) AND (SELECT COUNT(*) FROM messaging_deliveries WHERE user_id=? AND workspace_id=?)<?",
+  )
+    .bind(
+      requestId,
+      `reply:${digest}`,
+      link.id,
+      principal.userId,
+      principal.workspaceId,
+      plugin.id,
+      now,
+      now,
+      now + DELIVERY_TTL_MS,
+      link.id,
+      principal.userId,
+      principal.workspaceId,
+      MAX_RETAINED_DELIVERIES,
+    )
+    .run();
+  if (!claim.meta.changes) return "done";
+  let status = "unlinked";
+  if (
+    await linkedRequest(env, principal, reply.conversationId, reply.requestId)
+  ) {
+    try {
+      await plugin.send(env, {
+        chatId: link.chat_id,
+        text: boundedReply(reply.text),
+      });
+      status = "sent";
+    } catch {
+      status = "send_unknown";
+    }
+  }
+  await env.CONTROL_DB.prepare(
+    "UPDATE messaging_deliveries SET status=?,updated_at=? WHERE request_id=?",
+  )
+    .bind(status, Date.now(), requestId)
+    .run();
+  return "done";
+}
+
 async function hash(value: string): Promise<string> {
   return Array.from(
     new Uint8Array(

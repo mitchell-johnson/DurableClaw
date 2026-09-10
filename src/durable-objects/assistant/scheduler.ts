@@ -23,6 +23,8 @@ export type JobKind =
   | "batch_synthesis"
   | "subagent_cancel"
   | "subagent_dispatch"
+  | "channel_typing"
+  | "channel_reply"
   | "scheduled_task";
 
 export interface ScheduledJob {

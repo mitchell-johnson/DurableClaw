@@ -31,6 +31,12 @@ export interface MessagingPlugin {
     env: MessagingCredentials,
     reply: { chatId: string; text: string },
   ): Promise<void>;
+  /** Best-effort, ephemeral activity; never sends conversation content. */
+  sendTyping?(
+    env: MessagingCredentials,
+    target: { chatId: string },
+    signal: AbortSignal,
+  ): Promise<void>;
 }
 
 /** The host must reauthorize the stored owner on each dispatch and execute the
@@ -46,6 +52,16 @@ export class MessagingError extends Error {
     public readonly status: number,
   ) {
     super(message);
+  }
+}
+
+/** Sanitized provider feedback for retryable, ephemeral chat actions only. */
+export class MessagingActivityError extends MessagingError {
+  constructor(
+    status: number,
+    public readonly retryAfterMs = 30_000,
+  ) {
+    super("Messaging activity unavailable", status);
   }
 }
 

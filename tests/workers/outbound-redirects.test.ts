@@ -72,6 +72,28 @@ describe("outbound requests on workerd", () => {
     expect(requests).toHaveLength(1);
   });
 
+  it("supports Telegram typing with native abort signals and Request options", async () => {
+    const requests = upstream(async (request) => {
+      expect(request.url).toBe(
+        "https://api.telegram.org/bot12345:test_only_bot_token/sendChatAction",
+      );
+      expect(await request.json()).toEqual({
+        chat_id: "123",
+        action: "typing",
+      });
+      return Response.json({ ok: true, result: true });
+    });
+    const controller = new AbortController();
+    await telegramPlugin.sendTyping!(
+      telegramEnv,
+      { chatId: "123" },
+      controller.signal,
+    );
+    expect(requests).toHaveLength(1);
+    controller.abort();
+    expect(requests[0].signal.aborted).toBe(true);
+  });
+
   it("creates and reads OpenRouter batches with the configured credential", async () => {
     const requests = upstream((request) => {
       expect(request.headers.get("authorization")).toBe(

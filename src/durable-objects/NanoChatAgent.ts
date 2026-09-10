@@ -27,6 +27,8 @@ import { createBrowserTools } from "../action-library/tools/browser";
 import { createCodeTools } from "../action-library/tools/code";
 import { CodeRunner } from "../services/code/CodeRunner";
 import { authorizePrincipal } from "../auth";
+import { messagingRegistry, sendLinkedReply } from "../channels/service";
+import { ChannelActivity } from "./assistant/channelActivity";
 import { nativeAuthConfigured } from "../nativeAuth";
 import { createDeviceTools } from "../devices/tools";
 import { createConnectorTools } from "../connectors/tools";
@@ -651,12 +653,41 @@ export class NanoChatAgent implements DurableObject {
     }
   >();
   private subagentCap = MAX_CONCURRENT_SUBAGENTS;
+  private channelActivity: ChannelActivity;
   private dispatching = false;
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
     this.env = env;
     this.sql = state.storage.sql;
     this.history = new ConversationHistoryStore(this.sql);
+    this.channelActivity = new ChannelActivity({
+      env,
+      sql: this.sql,
+      hasWork: (conversationId, requestId) => {
+        if (!this.getConversationRow(conversationId)) return false;
+        const turn = this.activeTurns.get(conversationId);
+        return Boolean(
+          (turn?.requestId === requestId && !turn.controller.signal.aborted) ||
+          this.sql
+            .exec(
+              "SELECT batch_id FROM subagent_batches WHERE conversation_id=? AND request_id=? AND status IN ('active','synthesizing') LIMIT 1",
+              conversationId,
+              requestId,
+            )
+            .toArray().length,
+        );
+      },
+      principal: async () => {
+        if (!this.context) throw new Error("Not initialized");
+        return authorizePrincipal(
+          env,
+          this.context.user_id,
+          this.context.tenant_binding,
+        );
+      },
+      rearm: () => this.rearmAlarm(),
+      waitUntil: (work) => state.waitUntil(work),
+    });
     if (env.CODE_LOADER) this.codeRunner = new CodeRunner(env.CODE_LOADER);
     if (env.BROWSER)
       this.browserSessions = new BrowserSessions(env.BROWSER, state.storage);
@@ -1855,16 +1886,25 @@ CREATE TABLE IF NOT EXISTS context (
       completeChannelRequest(this.sql, requestId, text);
       return Response.json({ text });
     }
-    const text =
-      (await this.handleUserMessage(
-        null,
-        conversationId,
-        content,
-        undefined,
-        requestId,
-        90000,
-      )) ??
-      "This turn did not complete. Open the DurableClaw conversation to inspect its status before retrying.";
+    const work = this.handleUserMessage(
+      null,
+      conversationId,
+      content,
+      undefined,
+      requestId,
+      90000,
+    );
+    // handleUserMessage enters activeTurns synchronously. Start only for new,
+    // accepted work, not cached webhook retries or a saved-but-busy message.
+    this.channelActivity.start(conversationId, requestId);
+    let text: string;
+    try {
+      text =
+        (await work) ??
+        "This turn did not complete. Open the DurableClaw conversation to inspect its status before retrying.";
+    } finally {
+      this.channelActivity.stopIfIdle(conversationId, requestId);
+    }
     const pending =
       this.sql
         .exec(
@@ -3302,6 +3342,7 @@ CREATE TABLE IF NOT EXISTS context (
       }
       this.activeTurns.delete(conversationId);
       this.processingConversations.delete(conversationId);
+      this.channelActivity.stopIfIdle(conversationId, active.requestId);
       this.lastMessageAt.delete(conversationId);
       this.sendToConversation(conversationId, {
         type: "assistant_end",
@@ -4025,6 +4066,7 @@ CREATE TABLE IF NOT EXISTS context (
         this.activeTurns.delete(conversationId);
         this.processingConversations.delete(conversationId);
       }
+      this.channelActivity.stopIfIdle(conversationId, requestId);
       span.setAttributes({
         "agent.duration_ms": Date.now() - startTime,
         "agent.cancelled": activeTurn.controller.signal.aborted,
@@ -4206,6 +4248,10 @@ CREATE TABLE IF NOT EXISTS context (
   }
   private async runJob(job: ScheduledJob): Promise<void> {
     switch (job.kind) {
+      case "channel_typing":
+        return this.channelActivity.run(job);
+      case "channel_reply":
+        return this.runChannelReply(job);
       case "scheduled_task": {
         const data = JSON.parse(job.payload_json || "{}") as {
           description: string;
@@ -5136,7 +5182,14 @@ CREATE TABLE IF NOT EXISTS context (
     cancelJobs(this.sql, { job_id: batchDeadlineJobId(batchId) });
     cancelJobs(this.sql, { job_id: batchSynthesisJobId(batchId) });
     const batch = this.getBatchRecord(batchId);
-    if (batch) this.emitBatchStatus(batch, status);
+    if (batch) {
+      this.emitBatchStatus(batch, status);
+      if (batch.conversation_id && batch.request_id)
+        this.channelActivity.stopIfIdle(
+          batch.conversation_id,
+          batch.request_id,
+        );
+    }
   }
   private sendSubagentReply(
     conversationId: string,
@@ -5145,6 +5198,22 @@ CREATE TABLE IF NOT EXISTS context (
     messageId: string,
     content: string,
   ): void {
+    if (
+      parentRequestId &&
+      this.env.CONTROL_DB &&
+      messagingRegistry.list().some((plugin) => plugin.configured(this.env))
+    ) {
+      // Browser frames cannot reach the HTTP Telegram bridge. Persist a
+      // separate outbound job before marking this batch finished. The delivery
+      // service resolves the original owner/chat and claims each message once.
+      scheduleJob(this.sql, {
+        job_id: `channel_reply_${messageId}`,
+        kind: "channel_reply",
+        payload: { conversationId, requestId: parentRequestId, messageId },
+        run_at: Date.now(),
+        now: Date.now(),
+      });
+    }
     // The dispatch acknowledgement has already ended. Reusing its request ID
     // makes request-scoped clients discard the later answer. Channel bridges
     // also need the normal reply lifecycle; assistant_message alone is often
@@ -5177,6 +5246,67 @@ CREATE TABLE IF NOT EXISTS context (
       ...identity,
       content,
     });
+  }
+  private async runChannelReply(job: ScheduledJob): Promise<void> {
+    const data = JSON.parse(job.payload_json || "{}") as {
+      conversationId: string;
+      requestId: string;
+      messageId: string;
+    };
+    if (
+      !this.context ||
+      !validId(data.conversationId) ||
+      !validId(data.requestId) ||
+      !validId(data.messageId) ||
+      Date.now() - job.created_at > 3600_000
+    )
+      return;
+    const message = this.sql
+      .exec(
+        "SELECT content FROM messages WHERE conversation_id=? AND message_id=? AND role='assistant'",
+        data.conversationId,
+        data.messageId,
+      )
+      .toArray()[0];
+    if (!message || !this.getConversationRow(data.conversationId)) return;
+    // Retry only preparation. The D1 claim in sendLinkedReply makes an
+    // interrupted/ambiguous provider call terminal, never a duplicate send.
+    scheduleJob(this.sql, {
+      job_id: job.job_id,
+      kind: "channel_reply",
+      payload: data,
+      run_at: Date.now() + 30_000,
+      now: job.created_at,
+    });
+    await this.rearmAlarm();
+    try {
+      const principal = await authorizePrincipal(
+        this.env,
+        this.context.user_id,
+        this.context.tenant_binding,
+      );
+      if (principal.role !== "owner") {
+        deleteJob(this.sql, job.job_id);
+        return;
+      }
+      const result = await sendLinkedReply(this.env, principal, {
+        ...data,
+        text: String(message.content),
+      });
+      if (result === "done") deleteJob(this.sql, job.job_id);
+      else
+        scheduleJob(this.sql, {
+          job_id: job.job_id,
+          kind: "channel_reply",
+          payload: data,
+          run_at: Date.now() + 1000,
+          now: job.created_at,
+        });
+    } catch {
+      logWarn("Messaging reply preparation unavailable; retained for retry", {
+        "do.name": "NanoChatAgent",
+      });
+    }
   }
   private async failSubagentBatch(batchId: string): Promise<void> {
     const batch = this.getBatchRecord(batchId);

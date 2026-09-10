@@ -1,6 +1,11 @@
 import { constantTimeEqual } from "../auth";
 import { boundedJson } from "../utils/validation";
-import { boundedReply, MessagingError, type MessagingPlugin } from "./plugin";
+import {
+  boundedReply,
+  MessagingActivityError,
+  MessagingError,
+  type MessagingPlugin,
+} from "./plugin";
 
 const object = (value: unknown): Record<string, unknown> | null =>
   value !== null && typeof value === "object" && !Array.isArray(value)
@@ -95,6 +100,52 @@ export const telegramPlugin = Object.freeze<MessagingPlugin>({
       if (!object(body)?.ok) throw new Error("Provider rejected delivery");
     } catch {
       throw new MessagingError("Telegram delivery failed", 502);
+    }
+  },
+  async sendTyping(env, target, signal) {
+    if (
+      !telegramPlugin.configured(env) ||
+      !/^[1-9]\d{0,15}$/.test(target.chatId)
+    )
+      throw new MessagingActivityError(400);
+    try {
+      signal.throwIfAborted();
+      const response = await fetch(
+        `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendChatAction`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ chat_id: target.chatId, action: "typing" }),
+          signal: AbortSignal.any([signal, AbortSignal.timeout(3000)]),
+          redirect: "manual",
+        },
+      );
+      const body = object(
+        await boundedJson(
+          new Request("https://telegram-response.internal", {
+            method: "POST",
+            body: response.body,
+            duplex: "half",
+          } as RequestInit),
+          65536,
+        ),
+      );
+      if (!response.ok || body?.ok !== true) {
+        const status = response.ok ? Number(body?.error_code) : response.status;
+        const seconds = object(body?.parameters)?.retry_after;
+        throw new MessagingActivityError(
+          status,
+          status === 429 &&
+            typeof seconds === "number" &&
+            Number.isFinite(seconds)
+            ? Math.max(4000, Math.min(3600_000, Math.ceil(seconds * 1000)))
+            : 30_000,
+        );
+      }
+    } catch (error) {
+      if (error instanceof MessagingActivityError) throw error;
+      // Fetch errors can contain the bot token. Never pass them to logs/callers.
+      throw new MessagingActivityError(502);
     }
   },
 });

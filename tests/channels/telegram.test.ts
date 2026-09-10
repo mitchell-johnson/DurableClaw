@@ -125,4 +125,98 @@ describe("Telegram messaging adapter", () => {
     ).rejects.toThrow("Telegram delivery failed");
     expect(send).toHaveBeenCalledTimes(1);
   });
+
+  it("sends a cancellable typing action without message content or redirects", async () => {
+    const send = vi.fn(async () => Response.json({ ok: true, result: true }));
+    vi.stubGlobal("fetch", send);
+    const controller = new AbortController();
+    await channels.telegramPlugin.sendTyping!(
+      env,
+      { chatId: "42" },
+      controller.signal,
+    );
+    const [url, init] = send.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe(
+      `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendChatAction`,
+    );
+    expect(JSON.parse(init.body as string)).toEqual({
+      chat_id: "42",
+      action: "typing",
+    });
+    expect(init.redirect).toBe("manual");
+    controller.abort();
+    expect(init.signal?.aborted).toBe(true);
+    await expect(
+      channels.telegramPlugin.sendTyping!(
+        env,
+        { chatId: "42" },
+        controller.signal,
+      ),
+    ).rejects.toThrow("Messaging activity unavailable");
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["-100", "@someone", "https://evil.test", "0"])(
+    "rejects an unsafe typing recipient %s",
+    async (chatId) => {
+      const send = vi.fn();
+      vi.stubGlobal("fetch", send);
+      await expect(
+        channels.telegramPlugin.sendTyping!(
+          env,
+          { chatId },
+          new AbortController().signal,
+        ),
+      ).rejects.toMatchObject({ status: 400 });
+      expect(send).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([401, 403, 429, 500])(
+    "returns sanitized typing feedback for HTTP %s",
+    async (status) => {
+      const send = vi.fn(async () =>
+        Response.json(
+          {
+            ok: false,
+            description: env.TELEGRAM_BOT_TOKEN,
+            parameters: { retry_after: 42 },
+          },
+          { status },
+        ),
+      );
+      vi.stubGlobal("fetch", send);
+      await expect(
+        channels.telegramPlugin.sendTyping!(
+          env,
+          { chatId: "42" },
+          new AbortController().signal,
+        ),
+      ).rejects.toMatchObject({
+        status,
+        retryAfterMs: status === 429 ? 42000 : 30000,
+        message: "Messaging activity unavailable",
+      });
+      expect(send).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each(["invalid-json", "oversized", "network"])(
+    "sanitizes a %s typing failure",
+    async (failure) => {
+      vi.stubGlobal("fetch", async () => {
+        if (failure === "network") throw new Error(env.TELEGRAM_BOT_TOKEN);
+        return new Response(
+          failure === "oversized" ? "x".repeat(65537) : "not json",
+        );
+      });
+      await expect(
+        channels.telegramPlugin.sendTyping!(
+          env,
+          { chatId: "42" },
+          new AbortController().signal,
+        ),
+      ).rejects.toThrow("Messaging activity unavailable");
+    },
+  );
 });
