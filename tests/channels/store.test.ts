@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as channels from "../../src/channels";
+import { sendLinkedReply, sendLinkedTyping } from "../../src/channels/service";
 import type { AgentPrincipal } from "../../src/types";
 import type {
   MessagingEnv,
@@ -143,6 +144,208 @@ async function link(
 }
 
 describe("shared messaging authorization and delivery", () => {
+  async function linkedWork(f: ReturnType<typeof fixture>) {
+    await link(f);
+    const callback = dispatch();
+    await channels.handleMessagingWebhook(
+      webhook(event({ eventId: "work" })),
+      f.env,
+      callback,
+      f.registry,
+    );
+    return callback.mock.calls[0][1].requestId as string;
+  }
+
+  it("sends activity only to the accepting link with matching owner and conversation", async () => {
+    const f = fixture();
+    const requestId = await linkedWork(f);
+    f.plugin.sendTyping = vi.fn(async () => {});
+    const signal = new AbortController().signal;
+    const ping = (p = owner, conversation = "conversation", id = requestId) =>
+      sendLinkedTyping(f.env, p, conversation, id, signal, f.registry);
+    expect(await ping()).toBe(true);
+    expect(f.plugin.sendTyping).toHaveBeenCalledExactlyOnceWith(
+      f.env,
+      { chatId: "private-chat" },
+      signal,
+    );
+    expect(await ping(other)).toBe(false);
+    expect(await ping({ ...owner, role: "reader" })).toBe(false);
+    expect(await ping(owner, "different")).toBe(false);
+    expect(await ping(owner, "conversation", "unknown")).toBe(false);
+    f.sqlite.prepare("DELETE FROM messaging_links").run();
+    await channels.handleMessagingWebhook(
+      webhook(
+        event({
+          eventId: "new-link",
+          content: `/start ${(await issue(f)).code}`,
+        }),
+      ),
+      f.env,
+      dispatch(),
+      f.registry,
+    );
+    expect(await ping()).toBe(false);
+    expect(f.plugin.sendTyping).toHaveBeenCalledTimes(1);
+  });
+
+  it("honors cancellation while resolving a typing recipient", async () => {
+    const f = fixture();
+    const requestId = await linkedWork(f);
+    f.plugin.sendTyping = vi.fn(async () => {});
+    const controller = new AbortController();
+    const promise = sendLinkedTyping(
+      f.env,
+      owner,
+      "conversation",
+      requestId,
+      controller.signal,
+      f.registry,
+    );
+    controller.abort();
+    await expect(promise).rejects.toThrow();
+    expect(f.plugin.sendTyping).not.toHaveBeenCalled();
+  });
+
+  it("allows plugins without activity support and expires old request links", async () => {
+    const f = fixture();
+    const requestId = await linkedWork(f);
+    const ping = () =>
+      sendLinkedTyping(
+        f.env,
+        owner,
+        "conversation",
+        requestId,
+        new AbortController().signal,
+        f.registry,
+      );
+    expect(await ping()).toBe(false);
+    f.plugin.sendTyping = vi.fn(async () => {});
+    f.sqlite.prepare("UPDATE messaging_deliveries SET expires_at=0").run();
+    expect(await ping()).toBe(false);
+    expect(f.plugin.sendTyping).not.toHaveBeenCalled();
+  });
+
+  it("claims a later result once under concurrency and waits for the initial reply", async () => {
+    const f = fixture();
+    const requestId = await linkedWork(f);
+    const reply = {
+      conversationId: "conversation",
+      requestId,
+      messageId: "batch-result",
+      text: "All 20 agents counted to 10",
+    };
+    const send = () => sendLinkedReply(f.env, owner, reply, f.registry);
+    f.sqlite
+      .prepare(
+        "UPDATE messaging_deliveries SET status='processing' WHERE request_id=?",
+      )
+      .run(requestId);
+    expect(await send()).toBe("pending");
+    expect(f.sent).toHaveLength(2);
+    f.sqlite
+      .prepare(
+        "UPDATE messaging_deliveries SET status='sent' WHERE request_id=?",
+      )
+      .run(requestId);
+    await Promise.all(Array.from({ length: 10 }, send));
+    expect(f.sent).toHaveLength(3);
+    expect(f.sent[2]).toEqual({ chatId: "private-chat", text: reply.text });
+    expect(
+      f.sqlite
+        .prepare(
+          "SELECT status FROM messaging_deliveries WHERE request_id LIKE 'reply_%'",
+        )
+        .all(),
+    ).toEqual([{ status: "sent" }]);
+  });
+
+  it("does not let a crashed initial webhook hold a completed batch indefinitely", async () => {
+    const f = fixture();
+    const requestId = await linkedWork(f);
+    f.sqlite
+      .prepare(
+        "UPDATE messaging_deliveries SET status='sending',updated_at=? WHERE request_id=?",
+      )
+      .run(Date.now() - 111000, requestId);
+    expect(
+      await sendLinkedReply(
+        f.env,
+        owner,
+        {
+          conversationId: "conversation",
+          requestId,
+          messageId: "later",
+          text: "Result",
+        },
+        f.registry,
+      ),
+    ).toBe("done");
+    expect(f.sent).toHaveLength(3);
+  });
+
+  it("never retries an ambiguous background result send", async () => {
+    const f = fixture();
+    const requestId = await linkedWork(f);
+    f.plugin.send = vi.fn(async () => {
+      throw new Error("ambiguous send");
+    });
+    const send = () =>
+      sendLinkedReply(
+        f.env,
+        owner,
+        {
+          conversationId: "conversation",
+          requestId,
+          messageId: "later",
+          text: "Result",
+        },
+        f.registry,
+      );
+    await send();
+    await send();
+    expect(f.plugin.send).toHaveBeenCalledTimes(1);
+    expect(
+      f.sqlite
+        .prepare(
+          "SELECT status FROM messaging_deliveries WHERE request_id LIKE 'reply_%'",
+        )
+        .all(),
+    ).toEqual([{ status: "send_unknown" }]);
+  });
+
+  it("never retargets background results after unlink/relink or to another owner", async () => {
+    const f = fixture();
+    const requestId = await linkedWork(f);
+    const reply = {
+      conversationId: "conversation",
+      requestId,
+      messageId: "later",
+      text: "Private result",
+    };
+    await sendLinkedReply(f.env, other, reply, f.registry);
+    await sendLinkedReply(
+      f.env,
+      owner,
+      { ...reply, conversationId: "other" },
+      f.registry,
+    );
+    f.sqlite.prepare("DELETE FROM messaging_links").run();
+    await channels.handleMessagingWebhook(
+      webhook(
+        event({
+          eventId: "new-link",
+          content: `/start ${(await issue(f)).code}`,
+        }),
+      ),
+      f.env,
+      dispatch(),
+      f.registry,
+    );
+    await sendLinkedReply(f.env, owner, reply, f.registry);
+    expect(f.sent.map((reply) => reply.text)).not.toContain("Private result");
+  });
+
   it("exports the shared owner and webhook handlers", () => {
     expect(channels).toHaveProperty("handleMessagingOwnerRequest");
     expect(channels).toHaveProperty("handleMessagingWebhook");

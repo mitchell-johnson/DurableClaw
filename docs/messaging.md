@@ -4,6 +4,14 @@ Messaging adapters connect private text chats to an owner's DurableClaw conversa
 
 If a message arrives while the conversation is busy or rate-limited, it is saved in the transcript with an explicit notice that it has not run. Ask the agent to continue with that saved message after the current response finishes. A messaging turn has a 90-second deadline; partial output remains in the conversation and the browser receives the normal stopped event. Interrupted or ambiguous executions are not automatically repeated.
 
+## Working indicator and subagent results
+
+Telegram shows its native **typing…** indicator when an accepted message starts running. DurableClaw refreshes [`sendChatAction`](https://core.telegram.org/bots/api#sendchataction) roughly every four seconds while the foreground turn or any of its subagent batches is still active. The indicator continues after a dispatch acknowledgment while the subagents work. Results are sent back automatically as a separate reply when each batch finishes; you do not need to ask again or keep the browser open.
+
+Activity follows the coordinator's actual work state. Refreshes stop on completion, failure, cancellation/turn deadline, unlinking, or loss of owner authority. Pending batch activity and outbound result jobs survive coordinator reconstruction; an interrupted foreground turn does not leave a permanent typing loop. Telegram clears typing when a message arrives or the last action expires (within five seconds). An acknowledgment can briefly clear it until the next refresh.
+
+Typing is best-effort: calls have a three-second timeout, do not overlap for the same request, and never block the agent's response. Temporary failures back off for 30 seconds; rate limits honor `retry_after` up to one hour. Invalid or blocked destinations stop refreshes. Network delays or provider failures can therefore make the indicator disappear even while work continues; it is not a health guarantee. No extra secrets, permissions, or database migration are needed beyond the existing Telegram integration.
+
 ## Configure Telegram
 
 1. Create a bot through Telegram's official [BotFather](https://core.telegram.org/bots/tutorial#obtain-your-bot-token). Use one bot per DurableClaw deployment.
@@ -64,8 +72,10 @@ Unlinking immediately prevents new messages from being dispatched. A dispatch al
 - Every accepted event gets a durable claim **before** calling the agent or sending a reply. Concurrent webhook retries cannot repeat either operation.
 - The request ID is a SHA-256 hash of the provider ID and provider event ID. The conversation engine also persists a receipt for this ID.
 - The Worker waits for the agent's response and sends one reply through [`sendMessage`](https://core.telegram.org/bots/api#sendmessage). Replies use plain text, disable previews, and are shortened to fit Telegram's 4,096-character limit. Open the app for the full conversation and pending action approvals.
+- Later subagent results have separate durable jobs and deterministic `reply_…` delivery claims keyed by the original request and stored assistant message ID. The coordinator reauthorizes the owner and resolves the exact link that accepted the original request; unlink/relink cannot redirect a private result to a new chat. Results normally wait for the initial reply to finish, but a stuck webhook stops blocking them after 110 seconds. Preparation errors can retry for up to one hour without re-executing the agent.
 - Outbound sends have a ten-second deadline and reject redirects. The service does not automatically retry a failed or ambiguous send, because Telegram does not provide an idempotency key for `sendMessage`.
 - A crash or network failure after claiming work can leave a missing reply. The service acknowledges provider retries without rerunning the agent. Check the conversation and delivery status before sending a new request that could repeat work.
+- The same no-ambiguous-retry policy applies to later batch replies. A failed provider send is recorded as `send_unknown`; the full result remains in the conversation. Background replies count toward the same retention cap as initial replies.
 - Delivery statuses are `processing`, `dispatch_unknown`, `sending`, `sent`, `send_unknown`, and `unlinked`. A `processing` or `sending` record that remains unchanged beyond the dispatch deadline may also represent an interrupted request. No automatic recovery re-executes it.
 - Events older than 24 hours or more than five minutes in the future are ignored. Deduplication records last 48 hours, so expired records cannot make old webhook messages executable again. Records survive unlinking and relinking.
 - The control database retains at most 1,024 deliveries per owner/workspace, including connection confirmations, across all providers. At capacity it acknowledges and drops new events until records expire; it never discards fresh deduplication records to admit work. Expired codes and delivery records are removed on subsequent linked traffic, code issuance, or delivery-status inspection. Existing conversation retention is managed by the conversation engine.
@@ -101,6 +111,11 @@ interface MessagingPlugin {
     env: MessagingCredentials,
     reply: { chatId: string; text: string },
   ): Promise<void>;
+  sendTyping?(
+    env: MessagingCredentials,
+    target: { chatId: string },
+    signal: AbortSignal,
+  ): Promise<void>;
 }
 
 interface MessagingEvent {
@@ -115,5 +130,7 @@ interface MessagingEvent {
 Add the provider's secret bindings to the credentials/environment types and deployment configuration. `receive` must verify the provider's signature or secret before parsing the request, bound the streamed body, and accept only private human-authored text events. The shared handler additionally bounds identifiers and content and validates event age. If the provider uses a different account-linking command, normalize it to `/start CODE`. Plugins must not derive sender identity from display names or content, dynamically load executable code, or interpret chat messages as application approvals.
 
 `send` must use the provider's fixed HTTPS API destination, reject redirects, enforce body/time limits, avoid secrets in errors, and return only when delivery succeeds or fails. Do not add implicit retries for operations without provider idempotency. Add tests for provider forgery, group/bot rejection, duplicate events, and recipient isolation. The existing `example` adapter in the shared service tests exercises the same linking and dispatch logic without Telegram-specific assumptions.
+
+`sendTyping` is optional. Implement it only for ephemeral activity, honor the abort signal, and sanitize provider failures. `MessagingActivityError` communicates a safe status and retry delay without leaking provider URLs or tokens. The coordinator schedules activity; adapters must not create their own unbounded timers or send persistent loading messages.
 
 The host routes `/api/messaging/webhooks/:plugin` before browser authentication, delegates to `handleMessagingWebhook`, and supplies `MessagingDispatch`. That callback must reauthorize the stored owner, bind the request to the owner's conversation, enforce its deadline, and persist its own idempotency receipt. Owner routes call `handleMessagingOwnerRequest` only after authentication and same-origin checks.
