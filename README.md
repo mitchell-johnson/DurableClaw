@@ -1,137 +1,71 @@
 # DurableClaw
 
-DurableClaw is a stateful AI assistant built on Cloudflare Workers and SQLite-backed Durable Objects. It includes a React client, private file workspace, persistent conversations, semantic memory, scheduled check-ins, and recoverable read-only research agents.
+An AI assistant that keeps your conversations, works with your files, and helps you follow through on research and everyday tasks.
 
-One coordinator object owns a user's conversations within a workspace. Independent research tasks run in separate short-lived objects. Durable ledgers, deadlines, callback outboxes, cancellation records, and one shared alarm scheduler coordinate their lifecycle.
+Run your own private workspace, choose how the assistant responds, and decide which tools it can use. Saved conversations let you return to earlier work without starting from scratch.
 
-## Capabilities
+## What you can do
 
-- Streaming conversations with durable tool history, reconnect replay, stable message IDs, pagination, and request cancellation.
-- Up to 100 concurrently running research tasks per owner, with bounded dispatch, read-only tools, absolute deadlines, partial failure reporting, retryable callbacks, and separate research cancellation.
-- Conversation-scoped tool closures and page context. Background findings appear as their own durable message.
-- Explicit and automatic memory, semantic search, linked references, rolling summaries, warm/cold recall tiers, provenance, and retryable forgetting.
-- Deferred conversation titles, memory compression, and opt-in consolidation through a durable OpenRouter Batch API outbox.
-- Opt-in proactive checks with event cursors, deduplication, daily budgets, a zero-model quiet path, research synthesis, and a durable inbox.
-- Server-issued, argument-bound approvals for file mutations and remote MCP tools. Configurable persona, response depth, tool policy, and encrypted MCP credentials.
-- Invocation-owned OpenTelemetry exports, including cold alarms, with bounded buffering and flushing.
-- Extensible messaging plugins with Telegram private-chat linking, authenticated webhooks, replay protection, and shared conversation history.
-- Multiple paired Macs through an installable user service: outbound signed HTTPS, revocable device keys, and exact-command Bash approvals in the web app.
-- Always-on Google Workspace connectors with gogcli command discovery, approved read/write operations, private file transfers and a separate encrypted credential vault.
+- **Work with your files.** Find documents, ask questions about their contents, and review proposed changes before they are saved.
+- **Research several questions at once.** Ask the assistant to investigate different parts of a topic in the background and bring the findings back into your conversation.
+- **Browse the web.** Read websites and ask the assistant to interact with them. You review and approve actions such as filling forms or clicking buttons.
+- **Calculate and transform data.** Let the assistant write and run small scripts to check calculations, clean up data, or turn a list into a useful summary. Results come back into the conversation.
+- **Continue from Telegram.** Link a private chat to a conversation so messages and replies stay together in your workspace.
+- **Work with your Macs.** Pair your devices, choose a target, and approve the exact shell command before it runs.
+- **Connect Google Workspace.** Let the assistant work with Gmail and other Google services, with approval for general service commands.
+- **Remember what matters.** With memory enabled, keep useful preferences and context for future conversations. You can review saved memories or ask the assistant to forget them.
+- **Stay on top of follow-ups.** Schedule inbox items and opt into periodic checks for relevant updates from connected application events.
+- **Make it your own.** Adjust the assistant's personality, choose quick or more thorough responses, and control which tools are available.
 
-See [architecture](ARCHITECTURE.md), [API and integration contracts](docs/api.md), [runtime guarantees](docs/runtime.md), and [upgrading existing installations](docs/upgrading.md).
+## Things to try
 
-## Local setup
+Once your installation is ready, try asking:
 
-Use Node.js 22.12 or later and npm. Cloudflare Workers AI needs an authenticated Cloudflare account; model generation needs an OpenRouter key. Unit and workerd tests run without model credentials or remote Cloudflare resources.
+- “Find the notes about this project and summarize the decisions we've made.”
+- “Research these three questions separately and bring back the findings.”
+- “Open this website and explain what it says.”
+- “Use a script to group these expenses by category and calculate the totals.”
+- “Draft an update to my project notes and show me the changes before saving.”
+- “Remember that I prefer short answers.”
 
-```sh
-npm ci
-cp .dev.vars.example .dev.vars
-```
+File requests use your workspace. Memory and optional integrations need to be enabled before the assistant can use them.
 
-Set these values in `.dev.vars`:
+## You're in control
 
-| Setting                       | Purpose                                                              |
-| ----------------------------- | -------------------------------------------------------------------- |
-| `AGENT_TOKEN`                 | A long random bearer token for the default single-owner installation |
-| `INTERNAL_AUTH_SECRET`        | A separate random secret signing internal object requests            |
-| `OPENROUTER_API_KEY`          | OpenRouter model API access                                          |
-| `CHAT_MODEL`                  | Tool-capable foreground model ID                                     |
-| `BACKGROUND_MODEL`            | Tool-capable background research model ID                            |
-| `BATCH_MODEL`                 | Housekeeping model; uses synchronous DO requests when pinned         |
-| `OPENROUTER_PROVIDER`         | Optional exact provider slug, with fallback providers disabled       |
-| `BACKGROUND_REASONING_EFFORT` | Background reasoning level supported by the selected model           |
-| `MCP_CREDENTIALS_SECRET`      | A separate random secret when storing MCP credentials                |
+The assistant asks for approval before changing workspace files, interacting with websites, running commands on a paired Mac, or using connected service tools that require approval. You can restrict its tools, decline a proposed action, or stop work in progress. Stopping cannot undo an action a website has already received.
 
-Generate random secrets locally, for example with `openssl rand -hex 32`. Model IDs are deployment settings; verify tool support and provider availability for the IDs you choose. The current configuration selects `google/gemini-3.8-flash` through `google-ai-studio` and sets background reasoning to `high`. Pinned housekeeping executes in the Durable Object because OpenRouter's Batch API cannot enforce provider preferences. Foreground response depth remains user-controlled.
+Periodic checks and memory consolidation are off by default. Enable them when you want them, with limits on background activity.
 
-```sh
-npx wrangler d1 migrations apply durable-claw-control --local
-npm run dev
-```
+Your workspace is private to your installation's authenticated users, but requests to AI models and connected services are processed by those providers. Self-hosting does not mean everything runs locally.
 
-Open the local Worker URL and enter `AGENT_TOKEN`. The browser holds it in memory only. WebSockets use short-lived, single-use tickets bound to the authenticated identity and conversation. Refreshing the page requires signing in again.
+## Get started
 
-The included workspace supports file search/read/list, approved writes and indexing, and durable scheduled inbox items. Application events can be submitted through `POST /api/events` to exercise proactive checks. Wakes and memory consolidation start disabled in each user's settings.
+DurableClaw is a self-hosted project, not a hosted sign-up service. You'll need a Cloudflare account, an OpenRouter API key, and some command-line setup. Hosting and model usage may incur charges.
 
-## Enable semantic memory and document search
+1. Follow the [installation guide](docs/setup.md) to run it locally or deploy your own copy.
+2. Open your installation and sign in using the method you configured: an access token, Cloudflare Access, or native password/passkey sign-in.
+3. Start a conversation, adjust your preferences, and enable the optional features you want.
 
-Create separate 1024-dimension cosine Vectorize indexes:
+The default installation is for one owner. Supporting multiple users requires additional authentication setup. With token sign-in, refreshing the page requires entering the token again; Access and native sign-in use sessions.
 
-```sh
-npx wrangler vectorize create durable-claw-memory --dimensions=1024 --metric=cosine
-npx wrangler vectorize create durable-claw-documents --dimensions=1024 --metric=cosine
-```
+## Technical details
 
-Add bindings to `wrangler.toml`:
+DurableClaw runs on Cloudflare Workers with a React interface. Durable Objects and SQLite keep conversation and task state, R2 stores workspace files, and optional Vectorize indexes support memory and document search. AI models are configured through OpenRouter.
 
-```toml
-[[vectorize]]
-binding = "MEMORY_INDEX"
-index_name = "durable-claw-memory"
+Web browsing uses Cloudflare Browser Run. Kitesurf is preferred for new tasks; Chromium is available for persistent login sessions, recovery, and sites that need fuller browser compatibility. Browser sessions are separate for each conversation.
 
-[[vectorize]]
-binding = "DOCUMENT_INDEX"
-index_name = "durable-claw-documents"
-```
+Code execution uses Cloudflare Dynamic Workers and requires Workers Paid, with a fresh isolated JavaScript environment for each script. Scripts cannot access the network, workspace storage, or credentials; reading and saving files still use the existing tools.
 
-Create metadata indexes for the filters before writing vectors:
+For setup, integration work, or contributions:
 
-```sh
-npx wrangler vectorize create-metadata-index durable-claw-memory --property-name=user_namespace --type=string
-npx wrangler vectorize create-metadata-index durable-claw-memory --property-name=type --type=string
-npx wrangler vectorize create-metadata-index durable-claw-memory --property-name=conversation_id --type=string
-npx wrangler vectorize create-metadata-index durable-claw-documents --property-name=user_namespace --type=string
-npm run types
-```
-
-Memory metadata is also stored in an exactly enumerable R2 inventory, so listing and forgetting do not depend on a vector query's top-K limit. The coordinator's local inventory controls recall tiers and deletion barriers. Without `MEMORY_INDEX`, ordinary chat and files remain available and semantic memory is unavailable. Without `DOCUMENT_INDEX`, document search falls back to filename matching.
-
-## Deploy your installation
-
-Create your own control database and workspace bucket:
-
-```sh
-npx wrangler d1 create durable-claw-control
-npx wrangler r2 bucket create durable-claw-workspace
-```
-
-Replace the zero database ID in `wrangler.toml` with the ID returned by the command. Set your model IDs in `[vars]` and store production secrets with `wrangler secret put NAME`. Do not commit `.dev.vars`, secret values, account identifiers, or private data.
-
-```sh
-npx wrangler d1 migrations apply durable-claw-control --remote
-npm run check
-npm test
-npm run test:workers
-npm run build
-npm run deploy
-```
-
-`build` bundles the client and runs a Worker dry run. Only `deploy` publishes the Worker. The `v1` Durable Object migration is retained; `v2` adds research objects. Do not rename an existing object binding/class or rewrite migration history during an upgrade.
-
-## Authentication and integrations
-
-The default token intentionally represents one owner in one workspace. For multiple users, attach an `AUTH` service binding implementing the [authentication contract](docs/api.md#authentication-service). Identity comes from authentication; the public API does not accept caller-selected owner or workspace IDs.
-
-For production device access, use the built-in [Cloudflare Access authentication](docs/access-security.md). The browser automatically recognizes its Access session. Device keys authorize only device traffic; they never grant owner administration or approval access.
-
-For direct email/password and passkey sign-in, enable [native authentication](docs/native-auth.md). Credentials and sessions stay in a dedicated Durable Object. Initial setup uses the verified owner’s GitHub login; a recent passkey login can recover a password.
-
-Apply the new D1 migrations, then use **Connections** in the web app to link Telegram to your current conversation and create a private pairing code for each Mac. Follow [Telegram setup and plugin authoring](docs/messaging.md) and [Mac installation](docs/device-daemon.md). The daemon requires Node.js 22.12 or newer and runs as the logged-in user. Bash has that user's full permissions, and each execution needs web approval. See [device APIs and recovery semantics](docs/devices-api.md).
-
-Connect Gmail and other Google services through the [external service connector setup](docs/service-connectors.md). A native TypeScript port of gogcli runs entirely inside a credential Durable Object, which owns OAuth and invocation recovery. Generic commands require exact web approval.
-
-The included retrieval adapter is scoped to private workspace files. Implement `RetrievalAdapter` to connect application records, retaining authorization before reranking and hydration. Implement observers and inbox publication for your application through the documented interfaces. Remote MCP tools are optional and require explicit approval for execution.
-
-## Development checks
-
-```sh
-npm run check
-npm test
-npm run test:device
-npm run test:workers
-npm run build
-npm audit
-```
-
-The tests cover SQLite ordering/provenance, duplicate callbacks, restart recovery, deadlines, cancellation races, partial provider errors, credential and scope checks, MCP session behavior, exact memory enumeration, and browser reconnect/approval behavior. Native tests recreate objects against real local workerd storage; they do not claim to force a production eviction.
+- [Installation and development](docs/setup.md) — prerequisites, configuration, deployment, optional search, and checks.
+- [Browser setup and behavior](docs/browsing.md) — engine selection, approvals, session limits, and live testing.
+- [Code execution](docs/code-execution.md) — script format, isolation, limits, and setup.
+- [Cloudflare Access](docs/access-security.md) and [native sign-in](docs/native-auth.md) — owner authentication, passkeys, and recovery.
+- [Telegram messaging](docs/messaging.md) — linking private chats and adding messaging plugins.
+- [Mac installation](docs/device-daemon.md) and [device APIs](docs/devices-api.md) — pairing, command approvals, and recovery.
+- [Google Workspace connectors](docs/service-connectors.md) — account consent, command discovery, and private credential storage.
+- [Architecture](ARCHITECTURE.md) — components and how they fit together.
+- [API and integrations](docs/api.md) — authentication, application connections, and MCP tools.
+- [Runtime guarantees](docs/runtime.md) — recovery, cancellation, deadlines, and failure behavior.
+- [Upgrade guide](docs/upgrading.md) — updating an existing installation safely.

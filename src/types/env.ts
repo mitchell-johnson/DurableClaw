@@ -7,7 +7,11 @@ export interface Env extends Omit<
   | "OPENROUTER_PROVIDER"
   | "BACKGROUND_REASONING_EFFORT"
   | "IDENTITY"
+  | "BROWSER"
+  | "CODE_LOADER"
 > {
+  CODE_LOADER?: WorkerLoader;
+  BROWSER?: Fetcher;
   MEMORY_INDEX?: VectorizeIndex;
   DOCUMENT_INDEX?: VectorizeIndex;
   AUTH?: Fetcher;

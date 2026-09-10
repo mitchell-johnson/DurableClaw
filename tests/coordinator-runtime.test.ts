@@ -80,6 +80,168 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 describe("coordinator durable turn and dispatch recovery", () => {
+  it("returns all 20 subagent results through a new assistant turn without another user message", async () => {
+    const f = await fixture();
+    const frames: any[] = [];
+    f.agent.sendToConversation = (conversation: string, frame: any) => {
+      expect(conversation).toBe("conversation");
+      frames.push(frame);
+    };
+    // A channel bridge that sends replies on assistant_end must receive the
+    // follow-up as well as the already-finished dispatch acknowledgement.
+    const parentRequestId = "original-request";
+    const { batch_id } = await f.agent.spawnSubagentBatch({
+      origin: "chat",
+      conversation_id: "conversation",
+      request_id: parentRequestId,
+      tasks: Array.from({ length: 20 }, (_, i) => ({
+        goal: `Agent ${i + 1}: count to 10`,
+        tier: "background",
+      })),
+    });
+    frames.length = 0;
+    const tasks = f.sql.exec("SELECT task_id FROM subagent_tasks").toArray();
+    for (const [i, task] of tasks.entries()) {
+      await f.agent.handleSubagentResult(
+        new Request("https://do/subagent-result", {
+          method: "POST",
+          body: JSON.stringify({
+            task_id: task.task_id,
+            batch_id,
+            status: "done",
+            result: "1, 2, 3, 4, 5, 6, 7, 8, 9, 10",
+          }),
+        }),
+      );
+      if (i < 19) {
+        await f.agent.runBatchSynthesis(batch_id);
+        expect(frames).toEqual([]);
+      }
+    }
+    await f.agent.alarm();
+    const replies: string[] = [];
+    let text = "";
+    for (const frame of frames) {
+      if (frame.type === "assistant_start") text = "";
+      if (frame.type === "assistant_delta") text += frame.content;
+      if (frame.type === "assistant_end") replies.push(text);
+    }
+    expect(replies).toHaveLength(1);
+    for (let i = 1; i <= 20; i++) expect(replies[0]).toContain(`Agent ${i}:`);
+    expect(replies[0].match(/1, 2, 3, 4, 5, 6, 7, 8, 9, 10/g)).toHaveLength(20);
+    const start = frames.find((frame) => frame.type === "assistant_start");
+    expect(start).toMatchObject({
+      parent_request_id: parentRequestId,
+      batch_id,
+      message_id: `batch_${batch_id}`,
+    });
+    expect(start.request_id).not.toBe(parentRequestId);
+    expect(
+      frames.find((frame) => frame.type === "assistant_message")?.content,
+    ).toBe(replies[0]);
+    expect(
+      f.sql
+        .exec(
+          "SELECT status FROM subagent_batches WHERE batch_id = ?",
+          batch_id,
+        )
+        .toArray()[0].status,
+    ).toBe("completed");
+    await f.agent.runBatchSynthesis(batch_id);
+    expect(
+      frames.filter((frame) => frame.type === "assistant_end"),
+    ).toHaveLength(1);
+  });
+  it("defers mixed subagent outcomes until the foreground turn finishes, then reports failures too", async () => {
+    const f = await fixture();
+    const { batch_id } = await f.agent.spawnSubagentBatch({
+      origin: "chat",
+      conversation_id: "conversation",
+      request_id: "original",
+      tasks: ["Success", "Failure", "Timeout"].map((goal) => ({
+        goal,
+        tier: "background",
+      })),
+    });
+    f.sql.exec(
+      "UPDATE subagent_tasks SET status='done', result_json=? WHERE goal='Success'",
+      JSON.stringify({ text: "Confirmed result" }),
+    );
+    f.sql.exec(
+      "UPDATE subagent_tasks SET status='failed' WHERE goal='Failure'",
+    );
+    f.sql.exec(
+      "UPDATE subagent_tasks SET status='timeout' WHERE goal='Timeout'",
+    );
+    const frames: any[] = [];
+    f.agent.sendToConversation = (_id: string, frame: any) =>
+      frames.push(frame);
+    f.agent.processingConversations.add("conversation");
+    await f.agent.runBatchSynthesis(batch_id);
+    expect(frames).toEqual([]);
+    expect(
+      f.sql
+        .exec("SELECT kind FROM scheduled_jobs WHERE kind='batch_synthesis'")
+        .toArray(),
+    ).toHaveLength(1);
+    f.agent.processingConversations.delete("conversation");
+    await f.agent.runBatchSynthesis(batch_id);
+    const reply = frames.find(
+      (frame) => frame.type === "assistant_delta",
+    ).content;
+    expect(reply).toContain("Confirmed result");
+    expect(reply).toContain("couldn't be completed");
+    expect(reply).toContain("took too long");
+    expect(
+      frames.filter((frame) => frame.type === "assistant_end"),
+    ).toHaveLength(1);
+  });
+
+  it("delivers a terminal synthesis failure as a complete reply", async () => {
+    const f = await fixture();
+    const { batch_id } = await f.agent.spawnSubagentBatch({
+      origin: "chat",
+      conversation_id: "conversation",
+      request_id: "original",
+      tasks: [{ goal: "Research", tier: "background" }],
+    });
+    const frames: any[] = [];
+    f.agent.sendToConversation = (_id: string, frame: any) =>
+      frames.push(frame);
+    await f.agent.failSubagentBatch(batch_id);
+    expect(frames.map((frame) => frame.type)).toEqual([
+      "assistant_start",
+      "assistant_delta",
+      "assistant_end",
+      "assistant_message",
+      "subagent_batch",
+    ]);
+    expect(frames[1].content).toContain("could not deliver");
+    expect(frames.at(-1).status).toBe("failed");
+  });
+
+  it("does not deliver a research reply after Stop", async () => {
+    const f = await fixture();
+    const { batch_id } = await f.agent.spawnSubagentBatch({
+      origin: "chat",
+      conversation_id: "conversation",
+      request_id: "original",
+      tasks: [{ goal: "Research", tier: "background" }],
+    });
+    f.sql.exec("UPDATE subagent_tasks SET status='done'");
+    f.agent.handleCancelTurn("conversation", "original");
+    const frames: any[] = [];
+    f.agent.sendToConversation = (_id: string, frame: any) =>
+      frames.push(frame);
+    await f.agent.runBatchSynthesis(batch_id);
+    expect(frames).toEqual([]);
+    expect(
+      f.sql
+        .exec("SELECT status FROM subagent_batches WHERE batch_id=?", batch_id)
+        .toArray()[0].status,
+    ).toBe("cancelled");
+  });
+
   it("retains completed tool effects in durable history when Stop interrupts the next step", async () => {
     const f = await fixture();
     let effects = 0,

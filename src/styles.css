@@ -12,6 +12,11 @@
 body {
   margin: 0;
 }
+html,
+body,
+#root {
+  height: 100%;
+}
 button,
 input,
 textarea,
@@ -25,6 +30,8 @@ button {
   border: 1px solid #384b5b;
   padding: 0.55rem 0.85rem;
   border-radius: 0.5rem;
+  min-height: 2.75rem;
+  touch-action: manipulation;
 }
 button:hover {
   background: #2b4050;
@@ -66,6 +73,8 @@ select {
   border-radius: 0.5rem;
   padding: 0.65rem 0.75rem;
   width: 100%;
+  min-width: 0;
+  font-size: 1rem;
 }
 textarea {
   resize: vertical;
@@ -203,9 +212,12 @@ pre {
   overflow-wrap: anywhere;
 }
 .workspace {
+  height: 100vh;
   height: 100dvh;
   display: grid;
   grid-template-columns: 16rem minmax(0, 1fr);
+  overflow: hidden;
+  overflow-wrap: anywhere;
 }
 .sidebar {
   display: flex;
@@ -215,6 +227,18 @@ pre {
   padding: 1rem;
   background: #15212b;
   min-height: 0;
+  min-width: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+.sidebar-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+.sidebar > :not(.conversation-list) {
+  flex-shrink: 0;
 }
 .sidebar h1 {
   display: flex;
@@ -231,8 +255,16 @@ pre {
 }
 .conversation-list {
   flex: 1;
-  min-height: 0;
+  min-height: 8rem;
   overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+}
+.conversation-list-heading {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: #a0b0bc;
+  margin: 0 0 0.75rem;
 }
 .conversation-row {
   display: flex;
@@ -246,10 +278,20 @@ pre {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 0.82rem;
+  font-size: 0.9rem;
 }
 .icon-button {
-  padding: 0.25rem 0.5rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 2.75rem;
+  width: 2.75rem;
+  height: 2.75rem;
+  padding: 0;
+}
+.icon-button > span {
+  font-size: 1.5rem;
+  line-height: 1;
 }
 .main-panel {
   display: flex;
@@ -263,10 +305,18 @@ pre {
   align-items: center;
   padding: 0.6rem 1.5rem;
   border-bottom: 1px solid #344651;
+  flex-shrink: 0;
+  gap: 0.75rem;
+}
+.panel-header h2 {
+  flex: 1;
+  min-width: 0;
+  margin: 0.75rem 0;
 }
 .connection {
   font-size: 0.8rem;
   color: #e7b889;
+  flex-shrink: 0;
 }
 .connection.connected {
   color: #83d7c6;
@@ -275,6 +325,9 @@ pre {
   flex: 1;
   overflow: auto;
   padding: 1.5rem max(1.5rem, calc((100% - 52rem) / 2));
+  min-height: 0;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
 }
 .message {
   margin-bottom: 1.5rem;
@@ -297,7 +350,7 @@ pre {
   margin: 0.45rem 0;
 }
 .empty-state {
-  margin: 15vh auto 0;
+  margin: clamp(1rem, 12dvh, 7rem) auto 1rem;
   max-width: 32rem;
   text-align: center;
   color: #9cabb7;
@@ -316,6 +369,8 @@ pre {
 .tool-result summary,
 details summary {
   cursor: pointer;
+  min-height: 2.75rem;
+  align-content: center;
 }
 .tool-result pre {
   max-height: 18rem;
@@ -325,10 +380,14 @@ details summary {
   border-top: 1px solid #344651;
   padding: 1rem max(1.5rem, calc((100% - 52rem) / 2));
   background: #15212b;
+  flex-shrink: 0;
 }
 .composer textarea {
-  min-height: 5rem;
-  max-height: 14rem;
+  display: block;
+  min-height: 2.875rem;
+  max-height: min(10rem, 28dvh);
+  resize: none;
+  overflow-y: auto;
 }
 .composer-actions,
 .button-row {
@@ -339,7 +398,13 @@ details summary {
   margin-top: 0.6rem;
 }
 .composer-actions {
-  justify-content: space-between;
+  justify-content: flex-end;
+}
+.keyboard-hint {
+  margin-right: auto;
+}
+.composer-actions button {
+  min-width: 4.5rem;
 }
 .muted {
   color: #a0b0bc;
@@ -353,6 +418,9 @@ details summary {
 }
 .banner {
   margin: 0.75rem 1.5rem 0;
+  flex-shrink: 0;
+  max-height: 25%;
+  overflow: auto;
 }
 .notice {
   background: #233940;
@@ -362,12 +430,14 @@ details summary {
   margin: 1rem 0;
 }
 .notice > button {
-  margin-left: 0.65rem;
+  margin-top: 0.65rem;
 }
 .settings-page {
   overflow: auto;
   flex: 1;
   padding: 1.5rem max(1.5rem, calc((100% - 48rem) / 2));
+  min-height: 0;
+  overscroll-behavior: contain;
 }
 .connections-page pre,
 .connections-page code {
@@ -390,7 +460,9 @@ details summary {
   align-items: center;
 }
 .checkbox input {
-  width: auto;
+  width: 1.25rem;
+  height: 1.25rem;
+  flex-shrink: 0;
 }
 .code-input,
 .json-view {
@@ -415,20 +487,39 @@ details summary {
   border-radius: 0.4rem;
   padding: 0.25rem 0.5rem;
 }
-.modal-backdrop {
-  position: fixed;
-  inset: 0;
-  display: grid;
-  place-items: center;
+.modal::backdrop,
+.navigation-drawer::backdrop {
   background: #0009;
-  padding: 1rem;
 }
 .modal {
-  width: min(100%, 30rem);
+  width: min(calc(100% - 2rem), 30rem);
+  max-height: calc(100dvh - 2rem);
+  overflow: auto;
+  overscroll-behavior: contain;
+  color: inherit;
+  overflow-wrap: anywhere;
   background: #1b2b36;
   border: 1px solid #506572;
   border-radius: 0.75rem;
   padding: 1.5rem;
+}
+.navigation-drawer {
+  position: fixed;
+  inset: var(--workspace-top, 0px) auto auto 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-right: 1px solid #344651;
+  width: min(21rem, calc(100% - 3.5rem));
+  height: var(--workspace-height, 100dvh);
+  max-height: 100%;
+  max-width: none;
+  color: inherit;
+  background: #15212b;
+}
+.navigation-drawer .sidebar {
+  height: 100%;
+  border: 0;
 }
 .sr-only {
   position: absolute;
@@ -441,56 +532,87 @@ details summary {
   white-space: nowrap;
   border: 0;
 }
-@media (max-width: 720px) {
+@media (max-width: 860px) {
   .workspace {
+    position: fixed;
+    inset: var(--workspace-top, 0px) 0 auto;
+    height: var(--workspace-height, 100dvh);
     grid-template-columns: 1fr;
-    grid-template-rows: auto minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr);
   }
   .sidebar {
-    padding: 0.6rem;
-    flex-direction: row;
-    flex-wrap: wrap;
-    gap: 0.5rem;
-    border-right: 0;
-    border-bottom: 1px solid #344651;
-  }
-  .sidebar h1 {
-    margin-right: auto;
-    font-size: 0.95rem;
-  }
-  .sidebar nav {
-    display: flex;
-    flex: 1 0 100%;
-    gap: 0.3rem;
-  }
-  .sidebar nav button {
-    flex: 1;
-    font-size: 0.75rem;
-    padding: 0.4rem;
-  }
-  .conversation-list {
-    display: flex;
-    flex: 1 0 100%;
-    max-height: 3rem;
-    gap: 0.4rem;
-  }
-  .conversation-row {
-    max-width: 12rem;
-    flex-shrink: 0;
-  }
-  .sidebar > button:last-child {
-    font-size: 0.7rem;
-    padding: 0.4rem;
+    gap: 1rem;
+    padding: max(1rem, env(safe-area-inset-top)) 1rem
+      max(1rem, env(safe-area-inset-bottom))
+      max(1rem, env(safe-area-inset-left));
   }
   .transcript,
-  .composer,
   .settings-page {
-    padding: 1rem;
+    padding: 1rem max(1rem, env(safe-area-inset-right)) 1rem
+      max(1rem, env(safe-area-inset-left));
+  }
+  .settings-page {
+    padding-bottom: max(1.5rem, env(safe-area-inset-bottom));
+  }
+  .composer {
+    padding: 0.65rem max(0.75rem, env(safe-area-inset-right))
+      max(0.65rem, env(safe-area-inset-bottom))
+      max(0.75rem, env(safe-area-inset-left));
+  }
+  .composer-actions {
+    margin-top: 0.5rem;
+  }
+  .keyboard-hint {
+    display: none;
+  }
+  .message {
+    padding: 0.85rem 1rem;
+    margin-bottom: 1rem;
   }
   .message.user {
     margin-left: 1rem;
   }
   .panel-header {
-    padding: 0.2rem 1rem;
+    min-height: 3.75rem;
+    gap: 0.5rem;
+    padding: max(0.5rem, env(safe-area-inset-top))
+      max(0.75rem, env(safe-area-inset-right)) 0.5rem
+      max(0.75rem, env(safe-area-inset-left));
+  }
+  .panel-header h2 {
+    font-size: 1rem;
+  }
+  .panel-header .icon-button {
+    border-color: transparent;
+    background: transparent;
+  }
+  .connection {
+    font-size: 0.75rem;
+  }
+  .banner {
+    margin: 0.5rem 0.75rem 0;
+  }
+  .login {
+    padding: max(1rem, env(safe-area-inset-top))
+      max(1rem, env(safe-area-inset-right))
+      max(1rem, env(safe-area-inset-bottom))
+      max(1rem, env(safe-area-inset-left));
+  }
+  .login-card {
+    padding: 1.5rem;
+  }
+  .modal {
+    padding: 1.25rem;
+  }
+  .modal .button-row > button {
+    flex: 1 1 100%;
+  }
+}
+@media (pointer: coarse) {
+  .keyboard-hint {
+    display: none;
+  }
+  .code-input {
+    font-size: 1rem;
   }
 }

@@ -38,6 +38,143 @@ async function init(stub: any, conversation: string) {
 }
 
 describe("assembled coordinator on native storage", () => {
+  it("closes idle browser sessions on cancellation without cancelling a different active request", async () => {
+    const stub = fresh();
+    await init(stub, "browser-stop");
+    await runInDurableObject(stub, async (agent: any) => {
+      const closed: string[] = [];
+      agent.browserSessions = {
+        close: async (id: string) => {
+          closed.push(id);
+        },
+      };
+      const controller = new AbortController();
+      agent.activeTurns.set("browser-stop", {
+        requestId: "current",
+        controller,
+      });
+      agent.handleCancelTurn("browser-stop", "old", true);
+      expect(closed).toEqual([]);
+      expect(controller.signal.aborted).toBe(false);
+      agent.handleCancelTurn("browser-stop", "current", true);
+      expect(controller.signal.aborted).toBe(true);
+      expect(closed).toEqual(["browser-stop"]);
+      agent.handleCancelTurn("browser-stop", undefined, true);
+      expect(closed).toEqual(["browser-stop", "browser-stop"]);
+    });
+  });
+
+  it("registers conversation-scoped browser tools and closes them on deletion", async () => {
+    const stub = fresh();
+    await init(stub, "browser-one");
+    await init(stub, "browser-two");
+    await runInDurableObject(stub, async (agent: any) => {
+      const initial = await agent.ensureTools("browser-one");
+      expect(initial.browser_navigate).toBeUndefined();
+      const navigated: string[] = [];
+      const closed: string[] = [];
+      agent.browserSessions = {
+        navigate: async (id: string) => {
+          navigated.push(id);
+          return { title: id };
+        },
+        close: async (id: string) => {
+          closed.push(id);
+          return { closed: true };
+        },
+      };
+      const one = await agent.ensureTools("browser-one");
+      const two = await agent.ensureTools("browser-two");
+      const options = { toolCallId: "browse", messages: [] };
+      await one.browser_navigate.execute(
+        { url: "https://example.com" },
+        options,
+      );
+      await two.browser_navigate.execute(
+        { url: "https://example.com" },
+        options,
+      );
+      expect(navigated).toEqual(["browser-one", "browser-two"]);
+      expect(agent.allowedResearchToolIds()).not.toContain("browser_act");
+      expect(agent.handleDeleteConversation("browser-one").status).toBe(200);
+      expect(closed).toEqual(["browser-one"]);
+    });
+  });
+
+  it("recovers a settled batch after reconstruction and preserves its reply for a disconnected client", async () => {
+    const stub = fresh();
+    await init(stub, "research");
+    const result = await runInDurableObject(
+      stub,
+      async (agent: any, state: DurableObjectState) => {
+        // No provider/network work is needed to test durable completion delivery.
+        agent.pumpDispatch = async () => 0;
+        const { batch_id } = await agent.spawnSubagentBatch({
+          origin: "chat",
+          conversation_id: "research",
+          request_id: "original",
+          tasks: [{ goal: "Count to 10", tier: "background" }],
+        });
+        state.storage.sql.exec(
+          "UPDATE subagent_tasks SET status='done', result_json=?",
+          JSON.stringify({ text: "1, 2, 3, 4, 5, 6, 7, 8, 9, 10" }),
+        );
+        // Reconstruct against native SQLite and await its constructor work.
+        // Direct method calls inside this test do not pass through workerd's
+        // normal event/input gate, so capture the initialization explicitly.
+        let initialized!: Promise<unknown>;
+        const restoredState = {
+          storage: state.storage,
+          blockConcurrencyWhile: (callback: () => Promise<unknown>) =>
+            (initialized = callback()),
+          getWebSockets: () => [],
+          waitUntil: (promise: Promise<unknown>) => state.waitUntil(promise),
+        };
+        const restored = new NanoChatAgent(
+          restoredState as any,
+          env as any,
+        ) as any;
+        await initialized;
+        const frames: any[] = [];
+        restored.sendToConversation = (_conversation: string, frame: any) =>
+          frames.push(frame);
+        await restored.alarm();
+        const firstFrames = [...frames];
+        await restored.runBatchSynthesis(batch_id);
+        const history = await restored.fetch(
+          new Request("https://agent/conversations/research/messages", {
+            headers: await headers(),
+          }),
+        );
+        const rows = state.storage.sql
+          .exec(
+            "SELECT message_id, content FROM messages WHERE conversation_id='research'",
+          )
+          .toArray();
+        await state.storage.deleteAlarm();
+        return {
+          batch_id,
+          frames,
+          firstFrames,
+          rows,
+          history: await history.json(),
+        };
+      },
+    );
+    expect(result.frames).toEqual(result.firstFrames);
+    expect(result.frames.map((frame: any) => frame.type)).toEqual([
+      "assistant_start",
+      "assistant_delta",
+      "assistant_end",
+      "assistant_message",
+      "subagent_batch",
+    ]);
+    expect(result.rows).toHaveLength(1);
+    expect(result.rows[0].message_id).toBe(`batch_${result.batch_id}`);
+    expect(JSON.stringify(result.history)).toContain(
+      "1, 2, 3, 4, 5, 6, 7, 8, 9, 10",
+    );
+  });
   it("persists owner and history across reconstruction and rejects another signed owner", async () => {
     const stub = fresh();
     expect((await init(stub, "history")).status).toBe(200);
