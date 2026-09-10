@@ -1,7 +1,14 @@
 export interface Env extends Omit<
   Cloudflare.Env,
-  "CHAT_MODEL" | "BACKGROUND_MODEL" | "BATCH_MODEL" | "PROACTIVE_DISABLED"
+  | "CHAT_MODEL"
+  | "BACKGROUND_MODEL"
+  | "BATCH_MODEL"
+  | "PROACTIVE_DISABLED"
+  | "BROWSER"
+  | "CODE_LOADER"
 > {
+  CODE_LOADER?: WorkerLoader;
+  BROWSER?: Fetcher;
   MEMORY_INDEX?: VectorizeIndex;
   DOCUMENT_INDEX?: VectorizeIndex;
   AUTH?: Fetcher;

@@ -3,6 +3,12 @@ main = "src/server.ts"
 compatibility_date = "2026-08-15"
 compatibility_flags = ["nodejs_compat"]
 
+[[worker_loaders]]
+binding = "CODE_LOADER"
+
+[browser]
+binding = "BROWSER"
+
 [ai]
 binding = "AI"
 

@@ -38,6 +38,69 @@ async function init(stub: any, conversation: string) {
 }
 
 describe("assembled coordinator on native storage", () => {
+  it("closes idle browser sessions on cancellation without cancelling a different active request", async () => {
+    const stub = fresh();
+    await init(stub, "browser-stop");
+    await runInDurableObject(stub, async (agent: any) => {
+      const closed: string[] = [];
+      agent.browserSessions = {
+        close: async (id: string) => {
+          closed.push(id);
+        },
+      };
+      const controller = new AbortController();
+      agent.activeTurns.set("browser-stop", {
+        requestId: "current",
+        controller,
+      });
+      agent.handleCancelTurn("browser-stop", "old", true);
+      expect(closed).toEqual([]);
+      expect(controller.signal.aborted).toBe(false);
+      agent.handleCancelTurn("browser-stop", "current", true);
+      expect(controller.signal.aborted).toBe(true);
+      expect(closed).toEqual(["browser-stop"]);
+      agent.handleCancelTurn("browser-stop", undefined, true);
+      expect(closed).toEqual(["browser-stop", "browser-stop"]);
+    });
+  });
+
+  it("registers conversation-scoped browser tools and closes them on deletion", async () => {
+    const stub = fresh();
+    await init(stub, "browser-one");
+    await init(stub, "browser-two");
+    await runInDurableObject(stub, async (agent: any) => {
+      const initial = await agent.ensureTools("browser-one");
+      expect(initial.browser_navigate).toBeUndefined();
+      const navigated: string[] = [];
+      const closed: string[] = [];
+      agent.browserSessions = {
+        navigate: async (id: string) => {
+          navigated.push(id);
+          return { title: id };
+        },
+        close: async (id: string) => {
+          closed.push(id);
+          return { closed: true };
+        },
+      };
+      const one = await agent.ensureTools("browser-one");
+      const two = await agent.ensureTools("browser-two");
+      const options = { toolCallId: "browse", messages: [] };
+      await one.browser_navigate.execute(
+        { url: "https://example.com" },
+        options,
+      );
+      await two.browser_navigate.execute(
+        { url: "https://example.com" },
+        options,
+      );
+      expect(navigated).toEqual(["browser-one", "browser-two"]);
+      expect(agent.allowedResearchToolIds()).not.toContain("browser_act");
+      expect(agent.handleDeleteConversation("browser-one").status).toBe(200);
+      expect(closed).toEqual(["browser-one"]);
+    });
+  });
+
   it("recovers a settled batch after reconstruction and preserves its reply for a disconnected client", async () => {
     const stub = fresh();
     await init(stub, "research");
