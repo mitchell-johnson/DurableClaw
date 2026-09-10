@@ -16,6 +16,7 @@ import type { SqlExecLike } from "./memory";
 export type JobKind =
   | "summarize"
   | "wake"
+  | "wake_delivery"
   | "dream"
   | "housekeeping"
   | "housekeeping_cleanup"

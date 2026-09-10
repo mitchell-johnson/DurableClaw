@@ -823,6 +823,14 @@ export class ConnectorService {
           "Connector request outcome unavailable; never retry an uncertain action automatically",
         );
       }
+      // An email deleted between the bounded list and metadata read must not
+      // permanently block a heartbeat page. This exception is read-only and
+      // returns no provider error content; other failures still fail closed.
+      if (
+        execution.operation === "gmail_get_event" &&
+        upstream.response.status === 404
+      )
+        return json({ result: { missing: true } });
       if (!upstream.response.ok) {
         if (invocation)
           this.sql.exec(

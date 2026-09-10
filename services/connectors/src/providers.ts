@@ -1,6 +1,7 @@
 import type { ConnectorConfig } from "./core";
 import { textValue, record, validateGmailOperation } from "./validation";
 import { googleProvider } from "./google";
+import { prepareGmailEventRequest } from "./gmailEvents";
 
 export interface ProviderOAuthConfig {
   clientId: string;
@@ -89,15 +90,16 @@ export const gmailProvider: ServiceProvider = {
   account: (profile) => textValue(record(profile).emailAddress, 320),
   validateOperation: validateGmailOperation,
   requiresConfirmation: () => false,
-  prepareExecution: (execution, accessToken) => ({
-    transport: "native",
-    result: "wrapped",
-    request: new Request("http://connector/execute", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ...execution, access_token: accessToken }),
-    }),
-  }),
+  prepareExecution: (execution, accessToken) =>
+    prepareGmailEventRequest(execution, accessToken) ?? {
+      transport: "native",
+      result: "wrapped",
+      request: new Request("http://connector/execute", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...execution, access_token: accessToken }),
+      }),
+    },
 };
 
 /** Add a reviewed provider here and its matching agent/UI manifest under src/connectors/. */

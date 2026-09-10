@@ -118,18 +118,13 @@ it("keeps an admitted batch associated when the provider fails after spawning", 
   });
   expect(sql.exec("SELECT * FROM wake_signals_seen").toArray()).toHaveLength(1);
 });
-it("marks uncertain publication failed without replaying its consumed signals", async () => {
+it("retains untriaged observations when the daily budget is exhausted", async () => {
   const sql = storage();
   const d = deps(sql);
-  sql.exec("INSERT INTO agent_usage VALUES (?,20,100)", dayUtc(d.now));
-  mocks.outputs.mockImplementation(async () => {
-    recoverInterruptedWakes(sql, Date.now());
-    throw new Error("output response lost");
-  });
-  await runWakePassA(d);
-  expect(
-    sql.exec("SELECT cursor_value FROM observer_cursors").one().cursor_value,
-  ).toBe("1");
-  expect(sql.exec("SELECT * FROM wake_signals_seen").toArray()).toHaveLength(1);
+  sql.exec("INSERT INTO agent_usage VALUES (?,48,100)", dayUtc(d.now));
+  const result = await runWakePassA(d);
+  expect(result.outcome).toBe("failed");
+  expect(sql.exec("SELECT * FROM observer_cursors").toArray()).toEqual([]);
+  expect(sql.exec("SELECT * FROM wake_signals_seen").toArray()).toEqual([]);
   expect(mocks.loop).not.toHaveBeenCalled();
 });

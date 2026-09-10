@@ -110,6 +110,52 @@ function harness(providers?: ReadonlyMap<string, ServiceProvider>) {
 }
 
 describe("private connector service", () => {
+  it("executes authenticated heartbeat reads with fixed GETs, no native command, and safe deleted-message handling", async () => {
+    const h = harness();
+    const connectionId = await h.connect();
+    h.fetcher.mockImplementation(async (request) => {
+      const url = new URL(request.url);
+      expect(url.origin).toBe("https://gmail.googleapis.com");
+      expect(request.method).toBe("GET");
+      expect(request.headers.get("Authorization")).toBe("Bearer access-secret");
+      if (url.pathname.endsWith("/messages"))
+        return Response.json({
+          messages: [{ id: "abc" }],
+          nextPageToken: "next",
+        });
+      return Response.json(
+        { error: "private provider error" },
+        { status: 404 },
+      );
+    });
+    const call = (operation: string, args: unknown) =>
+      h.call("/v1/execute", {
+        connection_id: connectionId,
+        operation,
+        arguments: args,
+      });
+    const listed = await call("gmail_list_events", {
+      after: 1_800_000_000,
+      before: 1_800_003_600,
+    });
+    expect(listed.status).toBe(200);
+    expect(await listed.json()).toEqual({
+      result: { messages: [{ id: "abc" }], nextPageToken: "next" },
+    });
+    const missing = await call("gmail_get_event", { message_id: "abc" });
+    expect(missing.status).toBe(200);
+    expect(await missing.json()).toEqual({ result: { missing: true } });
+    expect(h.native).not.toHaveBeenCalled();
+    expect(h.sql.exec("SELECT * FROM connector_invocations").toArray()).toEqual(
+      [],
+    );
+    h.fetcher.mockResolvedValue(
+      Response.json({ error: "private details" }, { status: 403 }),
+    );
+    const denied = await call("gmail_get_event", { message_id: "abc" });
+    expect(denied.status).toBe(502);
+    expect(await denied.text()).not.toContain("private details");
+  });
   it("rejects missing authentication and non-owner calls", async () => {
     const h = harness();
     expect(

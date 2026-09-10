@@ -1,0 +1,21 @@
+# Gmail heartbeat observation
+
+The agent's heartbeat polls Gmail inbox arrival metadata through the existing private connector Durable Object. Both the legacy Gmail connection and Google connections with the Gmail service grant are supported. There is no Gmail webhook, extra container, new credential store, or generic command approval bypass.
+
+The internal operations `gmail_list_events` and `gmail_get_event` issue fixed HTTPS GET requests to Gmail. They accept only a bounded timestamp window and page token, or a validated message ID. Event reads return sender, subject, snippet, labels and Gmail's `internalDate`; they do not fetch full bodies or attachments, send mail, or modify read state. The existing connector signature, current owner checks, encrypted credentials, serialized refresh and Google service grant checks apply. Full gogcli commands retain their existing exact approval requirements. These internal operations are deliberately absent from the model's general tool manifest.
+
+The first observation starts one hour before the account is first seen. All eligible accounts get a baseline immediately, including accounts waiting for their rotation slot. Each pass examines at most five accounts with deterministic rotation and one page of at most 20 messages per account. A 45-second observation deadline bounds waiting. Subsequent pages preserve the original lower and upper timestamp bounds; the lower checkpoint advances only once the entire window has been read. A busy mailbox therefore drains over multiple heartbeats instead of discarding arrivals beyond the first page. More than five accounts may take multiple heartbeat intervals to check.
+
+Only messages still in the inbox are considered, excluding sent messages, drafts, spam and trash. Gmail's ID and internal arrival time identify each event; human-written Date headers do not control checkpoints. A one-minute overlap at completed windows covers timestamp boundaries, and the existing durable signal ledger suppresses repeated IDs. A message permanently deleted between listing and reading is skipped. An account with a failed or malformed metadata page keeps its checkpoint and retries that page; successfully checked accounts can still progress. A rejected continuation token rewinds the same window, retaining the timestamp bounds. An initial outage retains its first baseline so recovery can catch up. Extended outages or large backlogs can delay notifications, and mail archived or removed before polling is not reported.
+
+One aggregate `gmail` cursor contains per-connection checkpoints and the next rotation position. The owning agent stages it with the other observer cursors and includes it in its existing transactional wake recovery window. A separately persisted first-observation timestamp pins each account's baseline even if a later triage failure rolls its staged cursor back. Account failures report only the generic source “Gmail” to the heartbeat status, so incomplete scans cannot be presented as successful quiet checks. Metadata is bounded to 1,000 characters per signal, marked as untrusted data, and passed to the heartbeat's attention decision. Reading an event does not itself create a notification or authorize a service action. Reconnection creates a new connection identity and starts a new baseline.
+
+Google's official [message listing reference](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages/list), [metadata read reference](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages/get), and [search filtering guide](https://developers.google.com/workspace/gmail/api/guides/filtering) describe these API primitives and epoch-second date queries. Gmail [history cursors can expire](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.history/list); the heartbeat uses persisted time windows and bounded pagination so it does not depend on a long-lived Gmail history cursor.
+
+Relevant checks:
+
+```sh
+npx vitest run --config vitest.config.ts tests/gmail-observer.test.ts tests/connectors/gmail-events.test.ts tests/connectors/service.test.ts tests/connectors/service-google.test.ts tests/wake-authority.test.ts
+npm run check:connectors
+npm run check:vendor
+```

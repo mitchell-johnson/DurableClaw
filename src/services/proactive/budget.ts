@@ -1,6 +1,6 @@
 import type { SqlExecLike } from "../../durable-objects/assistant/memory";
 import type { Env } from "../../types/env";
-export const MAX_DAILY_TRIAGE_TURNS_DEFAULT = 20;
+export const MAX_DAILY_TRIAGE_TURNS_DEFAULT = 48;
 export const MAX_DAILY_SUBAGENT_SPAWNS_DEFAULT = 100;
 function readPositiveInt(raw: string | undefined): number | null {
   if (!raw) return null;

@@ -85,7 +85,7 @@ describe("memory visibility on reconstructed coordinator storage", () => {
       },
     );
     expect(result).toEqual({
-      version: 11,
+      version: 12,
       sources: [],
       excluded: [],
       cursors: [],

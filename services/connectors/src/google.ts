@@ -11,6 +11,7 @@ import {
   validateDelegatedAccount,
 } from "./delegation";
 import type { ServiceProvider, ProviderGrant } from "./providers";
+import { prepareGmailEventRequest } from "./gmailEvents";
 import {
   ConnectorError,
   fields,
@@ -152,7 +153,7 @@ export const googleProvider: ServiceProvider = {
   revokeEndpoint: "https://oauth2.googleapis.com/revoke",
   profileEndpoint: "https://openidconnect.googleapis.com/v1/userinfo",
   scopes: OIDC_SCOPES,
-  apiOrigins: ["https://www.googleapis.com"],
+  apiOrigins: ["https://www.googleapis.com", "https://gmail.googleapis.com"],
   oauth: (config) => ({
     clientId: config.GOOGLE_CLIENT_ID,
     clientSecret: config.GOOGLE_CLIENT_SECRET,
@@ -231,7 +232,9 @@ export const googleProvider: ServiceProvider = {
     if (
       operation === "gmail_search" ||
       operation === "gmail_get_message" ||
-      operation === "gmail_get_thread"
+      operation === "gmail_get_thread" ||
+      operation === "gmail_list_events" ||
+      operation === "gmail_get_event"
     )
       return validateGmailOperation(operation, input);
     if (operation !== "gog_execute")
@@ -378,6 +381,8 @@ export const googleProvider: ServiceProvider = {
       );
   },
   prepareExecution(execution, accessToken, account, config) {
+    const eventRead = prepareGmailEventRequest(execution, accessToken);
+    if (eventRead) return eventRead;
     if (needsMaps(execution) && !config?.GOOGLE_MAPS_API_KEY)
       throw new ConnectorError(
         503,

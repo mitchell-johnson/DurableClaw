@@ -778,6 +778,58 @@ function ToolResult({
     </details>
   );
 }
+type HeartbeatStatus = {
+  enabled: boolean;
+  intervalMinutes: number | null;
+  nextRunAt: number | null;
+  lastRun: {
+    status: string;
+    startedAt: number;
+    completedAt: number | null;
+    error: string | null;
+  } | null;
+};
+
+function HeartbeatSchedule({ heartbeat }: { heartbeat: HeartbeatStatus }) {
+  const lastRun = heartbeat.lastRun;
+  const lastCheck = lastRun ? (lastRun.completedAt ?? lastRun.startedAt) : null;
+  const outcome =
+    lastRun?.status === "failed"
+      ? "The last check could not finish."
+      : lastRun?.error != null
+        ? "Some sources could not be checked. They will be retried."
+        : lastRun?.status === "quiet"
+          ? "Nothing needed your attention."
+          : lastRun?.status === "running"
+            ? "Checking now…"
+            : lastRun?.status === "awaiting_batch"
+              ? "Reviewing new events…"
+              : lastRun?.status === "completed"
+                ? "Check complete."
+                : null;
+  return (
+    <div className="muted" aria-live="polite">
+      {lastCheck !== null && (
+        <p>
+          Last check:{" "}
+          <time dateTime={new Date(lastCheck).toISOString()}>
+            {new Date(lastCheck).toLocaleString()}
+          </time>
+        </p>
+      )}
+      {outcome && <p>{outcome}</p>}
+      {heartbeat.enabled && heartbeat.nextRunAt !== null && (
+        <p>
+          Next check:{" "}
+          <time dateTime={new Date(heartbeat.nextRunAt).toISOString()}>
+            {new Date(heartbeat.nextRunAt).toLocaleString()}
+          </time>
+        </p>
+      )}
+    </div>
+  );
+}
+
 function Settings({
   api,
   authOptions,
@@ -788,6 +840,7 @@ function Settings({
   onSignInAgain: () => Promise<void>;
 }) {
   const [persona, setPersona] = useState<Record<string, any> | null>(null);
+  const [heartbeat, setHeartbeat] = useState<HeartbeatStatus | null>(null);
   const [error, setError] = useState("");
   const [saved, setSaved] = useState(false);
   const [pending, setPending] = useState(false);
@@ -799,6 +852,7 @@ function Settings({
       .then((data) => {
         if (!active) return;
         setPersona(data.persona);
+        setHeartbeat(data.heartbeat ?? null);
         setMcp(JSON.stringify(data.persona.mcp_servers ?? [], null, 2));
         setDisabled((data.persona.disabled_tools ?? []).join(", "));
       })
@@ -818,7 +872,7 @@ function Settings({
       const servers = JSON.parse(mcp);
       if (!Array.isArray(servers))
         throw new Error("MCP servers must be a JSON array.");
-      await api("/api/agent/persona", {
+      const result = await api("/api/agent/persona", {
         method: "PUT",
         body: JSON.stringify({
           identity_override: persona?.identity_override || null,
@@ -834,6 +888,10 @@ function Settings({
           mcp_servers: servers,
         }),
       });
+      const status = result?.heartbeat
+        ? result
+        : await api("/api/agent/persona");
+      setHeartbeat(status.heartbeat ?? null);
       setSaved(true);
     } catch (error) {
       setError(errorText(error));
@@ -896,8 +954,9 @@ function Settings({
             Remember conversation context
           </label>
           <label>
-            Proactive check-ins
+            Heartbeat
             <select
+              aria-describedby="heartbeat-description"
               value={persona.wake_interval_minutes ?? ""}
               onChange={(event) =>
                 update(
@@ -907,13 +966,21 @@ function Settings({
               }
             >
               <option value="">Off</option>
-              {[10, 20, 30, 45, 60].map((value) => (
+              {[10, 15, 20, 30, 45, 60, 120, 240, 720, 1440].map((value) => (
                 <option key={value} value={value}>
-                  Every {value} minutes
+                  {value < 60
+                    ? `Every ${value} minutes`
+                    : `Every ${value / 60} ${value === 60 ? "hour" : "hours"}`}
                 </option>
               ))}
             </select>
           </label>
+          <p className="muted" id="heartbeat-description">
+            Checks workspace events and connected Gmail, then stays quiet when
+            nothing needs your attention. Important updates appear in your Inbox
+            and linked messaging apps.
+          </p>
+          {heartbeat && <HeartbeatSchedule heartbeat={heartbeat} />}
           <label>
             Memory consolidation
             <select

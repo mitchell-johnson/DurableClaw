@@ -1,4 +1,7 @@
-export const WAKE_INTERVAL_MINUTES = [10, 20, 30, 45, 60] as const;
+export const DEFAULT_WAKE_INTERVAL_MINUTES = 60;
+export const WAKE_INTERVAL_MINUTES = [
+  10, 15, 20, 30, 45, 60, 120, 240, 720, 1440,
+] as const;
 export type WakeIntervalMinutes = (typeof WAKE_INTERVAL_MINUTES)[number];
 export function isWakeIntervalMinutes(
   value: unknown,

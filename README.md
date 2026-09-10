@@ -59,6 +59,7 @@ Code execution uses Cloudflare Dynamic Workers and requires Workers Paid, with a
 For setup, integration work, or contributions:
 
 - [Installation and development](docs/setup.md) — prerequisites, configuration, deployment, optional search, and checks.
+- [Agent heartbeat](docs/heartbeat.md) — configurable background checks, Gmail arrivals, and quiet notifications.
 - [Browser setup and behavior](docs/browsing.md) — engine selection, approvals, session limits, and live testing.
 - [Code execution](docs/code-execution.md) — script format, isolation, limits, and setup.
 - [Cloudflare Access](docs/access-security.md) and [native sign-in](docs/native-auth.md) — owner authentication, passkeys, and recovery.

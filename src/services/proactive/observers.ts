@@ -1,6 +1,11 @@
 import type { Observer, Signal } from "./types";
+import type { AgentPrincipal, Env } from "../../types";
+import { createGmailObserver } from "./gmailObserver";
 /** A functional observer for application events submitted through the authenticated event endpoint. */
-export function createObservers(): Observer[] {
+export function createObservers(deps?: {
+  env: Env;
+  owner: AgentPrincipal;
+}): Observer[] {
   return [
     {
       name: "workspace_events",
@@ -16,7 +21,7 @@ export function createObservers(): Observer[] {
         const after = saved && /^\d+$/.test(saved) ? Number(saved) : 0;
         const rows = await ctx.db
           .prepare(
-            `SELECT sequence,kind,resource_id,summary,salience,occurred_at FROM workspace_events WHERE user_id=? AND workspace_id=? AND sequence>? ORDER BY sequence LIMIT 100`,
+            `SELECT sequence,kind,resource_id,summary,salience,occurred_at FROM workspace_events WHERE user_id=? AND workspace_id=? AND sequence>? ORDER BY sequence LIMIT 25`,
           )
           .bind(ctx.user.id, ctx.workspaceId, after)
           .all<{
@@ -44,5 +49,6 @@ export function createObservers(): Observer[] {
         }));
       },
     },
+    ...(deps ? [createGmailObserver(deps)] : []),
   ];
 }

@@ -6,6 +6,10 @@ import {
 } from "./cursors";
 
 export const WAKE_RECOVERY_SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS observer_baselines (
+  source_key TEXT PRIMARY KEY,
+  started_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS wake_observation_windows (
   run_id TEXT PRIMARY KEY,
   cursors_before_json TEXT NOT NULL,

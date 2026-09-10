@@ -7,6 +7,7 @@ import {
 } from "./mcpCrypto";
 import { requireHttpsURL, type MCPServerConfig } from "./mcpClient";
 import { RequestValidationError } from "../../utils/validation";
+import { isWakeIntervalMinutes } from "./wakeSettings";
 const id = z.string().regex(/^[a-zA-Z0-9_-]{1,128}$/);
 const server = z
   .object({
@@ -25,13 +26,9 @@ const schema = z
     mcp_servers: z.array(server).max(10).optional(),
     reasoning_effort: z.enum(["fast", "thorough"]).nullable().optional(),
     wake_interval_minutes: z
-      .union([
-        z.literal(10),
-        z.literal(20),
-        z.literal(30),
-        z.literal(45),
-        z.literal(60),
-      ])
+      .number()
+      .int()
+      .refine(isWakeIntervalMinutes)
       .nullable()
       .optional(),
     dream_interval_hours: z.number().int().nullable().optional(),

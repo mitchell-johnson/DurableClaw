@@ -35,6 +35,39 @@ export function validateGmailOperation(
   input: unknown,
 ): { operation: string; arguments: Record<string, unknown> } {
   const args = record(input);
+  if (operation === "gmail_list_events") {
+    fields(args, ["after", "before", "max", "page_token"]);
+    const max = args.max ?? 20;
+    if (
+      !Number.isSafeInteger(args.after) ||
+      Number(args.after) < 0 ||
+      !Number.isSafeInteger(args.before) ||
+      Number(args.before) <= Number(args.after) ||
+      Number(args.before) > 8_640_000_000_000 ||
+      !Number.isInteger(max) ||
+      Number(max) < 1 ||
+      Number(max) > 20
+    )
+      throw new ConnectorError(400, "Invalid Gmail event window");
+    return {
+      operation,
+      arguments: {
+        after: args.after,
+        before: args.before,
+        max,
+        ...(args.page_token === undefined
+          ? {}
+          : { page_token: textValue(args.page_token, 2048) }),
+      },
+    };
+  }
+  if (operation === "gmail_get_event") {
+    fields(args, ["message_id"]);
+    const id = textValue(args.message_id, 128);
+    if (!/^[a-f0-9]+$/i.test(id))
+      throw new ConnectorError(400, "Invalid Gmail event ID");
+    return { operation, arguments: { message_id: id } };
+  }
   if (operation === "gmail_search") {
     fields(args, ["query", "max", "include_body"]);
     const query = textValue(args.query, 2000);

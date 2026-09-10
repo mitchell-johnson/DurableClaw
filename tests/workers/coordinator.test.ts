@@ -201,7 +201,7 @@ describe("assembled coordinator on native storage", () => {
       },
     );
     expect(JSON.stringify(value.body)).toContain("Preserve this question");
-    expect(value.version).toBe(11);
+    expect(value.version).toBe(12);
     expect(
       (
         await stub.fetch("https://agent/conversations", {

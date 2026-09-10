@@ -30,6 +30,8 @@ export interface ObserverContext {
   readCursor(observerName: string): Promise<string | null>;
   writeCursor(observerName: string, cursorValue: string): Promise<void>;
   nowMs: number;
+  reportError?: (source: string) => void;
+  initialObservationTime?: (sourceKey: string) => number;
 }
 export interface Observer {
   name: string;

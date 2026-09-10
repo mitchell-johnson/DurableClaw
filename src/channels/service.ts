@@ -1,4 +1,5 @@
-import type { AgentPrincipal } from "../types";
+import { authorizePrincipal } from "../auth";
+import type { AgentPrincipal, Env } from "../types";
 import {
   boundedJson,
   jsonObject,
@@ -151,6 +152,173 @@ export async function sendLinkedReply(
     .bind(status, Date.now(), requestId)
     .run();
   return "done";
+}
+
+/** Proactive output has no inbound request. Resolve only this owner's current
+ * private links, and durably claim each recipient before contacting a provider.
+ * A provider timeout is ambiguous and must never cause a second send. */
+export async function sendLinkedNotification(
+  env: Env,
+  principal: AgentPrincipal,
+  notification: {
+    id: string;
+    text: string;
+    shouldSend?: () => boolean;
+  },
+  registry: MessagingRegistry = messagingRegistry,
+): Promise<void> {
+  if (
+    typeof notification.id !== "string" ||
+    !notification.id.trim() ||
+    notification.id.length > 256 ||
+    typeof notification.text !== "string" ||
+    !notification.text.trim()
+  )
+    throw new MessagingError("Invalid notification", 400);
+  const enabled = () => notification.shouldSend?.() !== false;
+  if (principal.role !== "owner" || !enabled()) return;
+  const authorize = async () => {
+    const current = await authorizePrincipal(
+      env,
+      principal.userId,
+      principal.workspaceId,
+    );
+    if (current.role !== "owner")
+      throw new MessagingError("Owner access required", 403);
+  };
+  await authorize();
+  if (!enabled()) return;
+  const links = await env.CONTROL_DB.prepare(
+    "SELECT * FROM messaging_links WHERE user_id=? AND workspace_id=? ORDER BY id LIMIT 101",
+  )
+    .bind(principal.userId, principal.workspaceId)
+    .all<Link>();
+  if (!enabled()) return;
+  if (links.results.length > 100)
+    throw new MessagingError("Too many messaging connections", 503);
+  // Bound cleanup work to the owner's retention limit; never evict live claims
+  // merely to make room, since doing so could repeat an ambiguous provider send.
+  await env.CONTROL_DB.prepare(
+    "DELETE FROM messaging_deliveries WHERE request_id IN (SELECT request_id FROM messaging_deliveries WHERE user_id=? AND workspace_id=? AND expires_at<=? LIMIT ?)",
+  )
+    .bind(
+      principal.userId,
+      principal.workspaceId,
+      Date.now(),
+      MAX_RETAINED_DELIVERIES,
+    )
+    .run();
+  if (!enabled()) return;
+  for (const link of links.results) {
+    const plugin = registry.get(link.plugin_id);
+    if (!plugin?.configured(env)) continue;
+    const currentLink = () =>
+      env.CONTROL_DB.prepare(
+        "SELECT id FROM messaging_links WHERE id=? AND user_id=? AND workspace_id=? AND plugin_id=? AND sender_id=? AND chat_id=? AND conversation_id=?",
+      )
+        .bind(
+          link.id,
+          principal.userId,
+          principal.workspaceId,
+          plugin.id,
+          link.sender_id,
+          link.chat_id,
+          link.conversation_id,
+        )
+        .first();
+    const eventDigest = await hash(
+      JSON.stringify([
+        principal.userId,
+        principal.workspaceId,
+        notification.id,
+        plugin.id,
+      ]),
+    );
+    if (!enabled()) return;
+    // Event deduplication survives unlink/relink; the claim still identifies
+    // the exact link we resolved and may never retarget a replacement recipient.
+    const digest = await hash(JSON.stringify([eventDigest, link.id]));
+    if (!enabled()) return;
+    const requestId = `notification_${digest}`;
+    const eventId = `notification:${eventDigest}`;
+    const now = Date.now();
+    const claim = await env.CONTROL_DB.prepare(
+      "INSERT OR IGNORE INTO messaging_deliveries(request_id,event_id,link_id,user_id,workspace_id,plugin_id,status,created_at,updated_at,expires_at) SELECT ?,?,id,user_id,workspace_id,plugin_id,'sending',?,?,? FROM messaging_links WHERE id=? AND user_id=? AND workspace_id=? AND plugin_id=? AND sender_id=? AND chat_id=? AND conversation_id=? AND (SELECT COUNT(*) FROM messaging_deliveries WHERE user_id=? AND workspace_id=?)<?",
+    )
+      .bind(
+        requestId,
+        eventId,
+        now,
+        now,
+        now + DELIVERY_TTL_MS,
+        link.id,
+        principal.userId,
+        principal.workspaceId,
+        plugin.id,
+        link.sender_id,
+        link.chat_id,
+        link.conversation_id,
+        principal.userId,
+        principal.workspaceId,
+        MAX_RETAINED_DELIVERIES,
+      )
+      .run();
+    if (!enabled()) return;
+    if (!claim.meta.changes) {
+      const existing = await env.CONTROL_DB.prepare(
+        "SELECT request_id FROM messaging_deliveries WHERE plugin_id=? AND event_id=? AND user_id=? AND workspace_id=?",
+      )
+        .bind(plugin.id, eventId, principal.userId, principal.workspaceId)
+        .first();
+      if (!enabled()) return;
+      if (existing) continue;
+      const linked = await currentLink();
+      if (!enabled()) return;
+      if (!linked) continue;
+      throw new MessagingError("Messaging delivery capacity reached", 503);
+    }
+    let status = "unlinked";
+    let sendStarted = false;
+    try {
+      await authorize();
+      if (!enabled()) return;
+      const linked = await currentLink();
+      if (!enabled()) return;
+      if (linked && plugin.configured(env) && enabled()) {
+        sendStarted = true;
+        await plugin.send(env, {
+          chatId: link.chat_id,
+          text: boundedReply(notification.text),
+        });
+        status = "sent";
+      }
+    } catch (error) {
+      if (!sendStarted) {
+        // Authority/storage preflight failed without contacting the provider;
+        // allow the durable job to retry preparation after recovery.
+        await env.CONTROL_DB.prepare(
+          "DELETE FROM messaging_deliveries WHERE request_id=? AND user_id=? AND workspace_id=? AND link_id=? AND status='sending'",
+        )
+          .bind(requestId, principal.userId, principal.workspaceId, link.id)
+          .run();
+        throw error;
+      }
+      status = "send_unknown";
+    }
+    await env.CONTROL_DB.prepare(
+      "UPDATE messaging_deliveries SET status=?,updated_at=? WHERE request_id=? AND user_id=? AND workspace_id=? AND link_id=?",
+    )
+      .bind(
+        status,
+        Date.now(),
+        requestId,
+        principal.userId,
+        principal.workspaceId,
+        link.id,
+      )
+      .run();
+    if (!enabled()) return;
+  }
 }
 
 async function hash(value: string): Promise<string> {
