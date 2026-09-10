@@ -1,5 +1,7 @@
 # Upgrading an existing installation
 
+Code execution adds the optional `CODE_LOADER` Worker Loader binding. Preserve the `[[worker_loaders]]` configuration when upgrading to enable the foreground `execute_code` tool, or omit it to disable execution. This needs no new storage migration or secret. See [code execution](code-execution.md) for account requirements and limits.
+
 Browser tools add the optional `[browser]` binding in `wrangler.toml` and `@cloudflare/puppeteer` to the lockfile. Preserve that binding when merging your deployment settings to enable browsing. No new Durable Object migration is needed; see [browser setup](browsing.md).
 
 New browser sessions prefer Kitesurf. Existing persisted browser records without an engine are treated as Chromium and remain reconnectable. To use Chromium for a new task, the agent supplies `engine: "chromium"` to `browser_navigate`. No new binding or secret is needed for Kitesurf.

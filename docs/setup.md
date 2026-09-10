@@ -97,6 +97,8 @@ The included retrieval adapter is scoped to private workspace files. Implement `
 
 ## Development checks
 
+The included `CODE_LOADER` binding enables isolated script execution. See [code execution](code-execution.md) for the script format, limits, and optional disablement. Scripts use no additional secrets or deployment namespaces.
+
 ```sh
 npm run check
 npm test

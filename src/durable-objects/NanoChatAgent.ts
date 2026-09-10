@@ -24,6 +24,8 @@ import {
 import { createMcpTool } from "./assistant/mcpTool";
 import { BrowserSessions } from "../services/browser/BrowserSessions";
 import { createBrowserTools } from "../action-library/tools/browser";
+import { createCodeTools } from "../action-library/tools/code";
+import { CodeRunner } from "../services/code/CodeRunner";
 import { authorizePrincipal } from "../auth";
 import {
   exportLegacyPage,
@@ -605,6 +607,7 @@ export class NanoChatAgent implements DurableObject {
   private sql: SqlStorage;
   private history: ConversationHistoryStore;
   private browserSessions?: BrowserSessions;
+  private codeRunner?: CodeRunner;
   private context: InMemoryContext | null = null;
   private memoryWriteEpoch = 0;
   private socketContext: Map<
@@ -641,6 +644,7 @@ export class NanoChatAgent implements DurableObject {
     this.env = env;
     this.sql = state.storage.sql;
     this.history = new ConversationHistoryStore(this.sql);
+    if (env.CODE_LOADER) this.codeRunner = new CodeRunner(env.CODE_LOADER);
     if (env.BROWSER)
       this.browserSessions = new BrowserSessions(env.BROWSER, state.storage);
     void this.state.blockConcurrencyWhile(async () => {
@@ -1156,6 +1160,21 @@ CREATE TABLE IF NOT EXISTS context (
         ? createMemoryRetrievalTool(retrievalContext, { sql: this.sql })
         : {};
     const merged: Record<string, unknown> = {
+      ...createCodeTools({
+        runner: this.codeRunner,
+        conversationId,
+        signal,
+        authorize: async () => {
+          if (!this.context) throw new Error("Agent not initialized");
+          const principal = await authorizePrincipal(
+            this.env,
+            this.context.user_id,
+            this.context.tenant_binding,
+          );
+          if (principal.role !== "owner")
+            throw new Error("Owner permission required");
+        },
+      }),
       ...createBrowserTools({
         sessions: this.browserSessions,
         conversationId,

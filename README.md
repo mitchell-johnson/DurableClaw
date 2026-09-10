@@ -9,6 +9,7 @@ Run your own private workspace, choose how the assistant responds, and decide wh
 - **Work with your files.** Find documents, ask questions about their contents, and review proposed changes before they are saved.
 - **Research several questions at once.** Ask the assistant to investigate different parts of a topic in the background and bring the findings back into your conversation.
 - **Browse the web.** Read websites and ask the assistant to interact with them. You review and approve actions such as filling forms or clicking buttons.
+- **Calculate and transform data.** Let the assistant write and run small scripts to check calculations, clean up data, or turn a list into a useful summary. Results come back into the conversation.
 - **Remember what matters.** With memory enabled, keep useful preferences and context for future conversations. You can review saved memories or ask the assistant to forget them.
 - **Stay on top of follow-ups.** Schedule inbox items and opt into periodic checks for relevant updates from connected application events.
 - **Make it your own.** Adjust the assistant's personality, choose quick or more thorough responses, and control which tools are available.
@@ -20,6 +21,7 @@ Once your installation is ready, try asking:
 - “Find the notes about this project and summarize the decisions we've made.”
 - “Research these three questions separately and bring back the findings.”
 - “Open this website and explain what it says.”
+- “Use a script to group these expenses by category and calculate the totals.”
 - “Draft an update to my project notes and show me the changes before saving.”
 - “Remember that I prefer short answers.”
 
@@ -49,10 +51,13 @@ DurableClaw runs on Cloudflare Workers with a React interface. Durable Objects a
 
 Web browsing uses Cloudflare Browser Run. Kitesurf is preferred for new tasks; Chromium is available for persistent login sessions, recovery, and sites that need fuller browser compatibility. Browser sessions are separate for each conversation.
 
+Code execution uses Cloudflare Dynamic Workers and requires Workers Paid, with a fresh isolated JavaScript environment for each script. Scripts cannot access the network, workspace storage, or credentials; reading and saving files still use the existing tools.
+
 For setup, integration work, or contributions:
 
 - [Installation and development](docs/setup.md) — prerequisites, configuration, deployment, optional search, and checks.
 - [Browser setup and behavior](docs/browsing.md) — engine selection, approvals, session limits, and live testing.
+- [Code execution](docs/code-execution.md) — script format, isolation, limits, and setup.
 - [Architecture](ARCHITECTURE.md) — components and how they fit together.
 - [API and integrations](docs/api.md) — authentication, application connections, and MCP tools.
 - [Runtime guarantees](docs/runtime.md) — recovery, cancellation, deadlines, and failure behavior.
