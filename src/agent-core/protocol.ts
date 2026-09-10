@@ -46,6 +46,9 @@ export interface HistoryUserMessageFrame {
 /** Optional for older conversational agents; DurableClaw identifies every turn. */
 export interface TurnIdentity {
   request_id?: string;
+  /** Background replies have a fresh request ID and retain their origin here. */
+  parent_request_id?: string;
+  batch_id?: string;
   /** Durable assistant-message identity, reused by reconnect replay. */
   message_id?: string;
 }

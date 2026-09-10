@@ -231,8 +231,12 @@ export function useAgentChat(
   const ensureTurnMessage = useCallback(
     (messageId?: string) => {
       if (currentTurnRef.current < 0) {
-        currentTurnRef.current = messagesRef.current.length;
-        setMessages((prev) => [...prev, { role: "assistant", content: "" }]);
+        const existing = messageId
+          ? messageIndexesRef.current.get(messageId)
+          : undefined;
+        currentTurnRef.current = existing ?? messagesRef.current.length;
+        if (existing === undefined)
+          setMessages((prev) => [...prev, { role: "assistant", content: "" }]);
       }
       if (messageId)
         messageIndexesRef.current.set(messageId, currentTurnRef.current);
