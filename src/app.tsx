@@ -1,9 +1,74 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import {
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type FormEvent,
+  type ReactNode,
+} from "react";
 import { useAgentChat, type ToolResultRecord } from "./hooks/useAgentChat";
 import { createApi, createChatEndpoints, type Api } from "./hooks/api";
 import "./styles.css";
 
 type Tab = "chat" | "settings" | "memory" | "activity";
+
+function useCompactLayout() {
+  const [compact, setCompact] = useState(
+    () => window.matchMedia("(max-width: 860px)").matches,
+  );
+  useEffect(() => {
+    const media = window.matchMedia("(max-width: 860px)");
+    const update = () => setCompact(media.matches);
+    update();
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
+  return compact;
+}
+
+function Modal({
+  children,
+  className = "modal",
+  labelledBy,
+  onClose,
+}: {
+  children: ReactNode;
+  className?: string;
+  labelledBy: string;
+  onClose: () => void;
+}) {
+  const ref = useRef<HTMLDialogElement>(null);
+  useLayoutEffect(() => {
+    const dialog = ref.current!;
+    dialog.showModal();
+    return () => dialog.close();
+  }, []);
+  return (
+    <dialog
+      ref={ref}
+      className={className}
+      aria-labelledby={labelledBy}
+      onCancel={(event) => {
+        event.preventDefault();
+        onClose();
+      }}
+      onClick={(event) => {
+        if (event.target !== event.currentTarget) return;
+        const bounds = event.currentTarget.getBoundingClientRect();
+        if (
+          event.clientX < bounds.left ||
+          event.clientX > bounds.right ||
+          event.clientY < bounds.top ||
+          event.clientY > bounds.bottom
+        )
+          onClose();
+      }}
+    >
+      {children}
+    </dialog>
+  );
+}
 function errorText(error: unknown) {
   return error instanceof Error
     ? error.message
@@ -84,18 +149,70 @@ function Workspace({ token, signOut }: { token: string; signOut: () => void }) {
   const [draft, setDraft] = useState("");
   const [actionError, setActionError] = useState("");
   const [deleting, setDeleting] = useState<string | null>(null);
-  const endRef = useRef<HTMLDivElement>(null);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const compact = useCompactLayout();
+  const workspaceRef = useRef<HTMLDivElement>(null);
+  const transcriptRef = useRef<HTMLDivElement>(null);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
+  const followMessages = useRef(true);
   useEffect(() => {
     void chat.connect().catch((error) => setActionError(errorText(error)));
   }, [token]);
   useEffect(() => {
-    endRef.current?.scrollIntoView({ block: "end" });
-  }, [chat.messages, chat.activeToolCalls]);
+    if (!compact) setMenuOpen(false);
+  }, [compact]);
+  useLayoutEffect(() => {
+    // Safari's on-screen keyboard changes the visual viewport, not 100dvh.
+    const viewport = window.visualViewport;
+    const workspace = workspaceRef.current;
+    if (!compact || !viewport || !workspace) return;
+    const resize = () => {
+      // Preserve native pinch zoom instead of resizing the UI while zooming.
+      if (viewport.scale !== 1) return;
+      workspace.style.setProperty("--workspace-height", `${viewport.height}px`);
+      workspace.style.setProperty("--workspace-top", `${viewport.offsetTop}px`);
+      const transcript = transcriptRef.current;
+      if (transcript && followMessages.current)
+        transcript.scrollTop = transcript.scrollHeight;
+    };
+    resize();
+    viewport.addEventListener("resize", resize);
+    viewport.addEventListener("scroll", resize);
+    return () => {
+      viewport.removeEventListener("resize", resize);
+      viewport.removeEventListener("scroll", resize);
+      workspace.style.removeProperty("--workspace-height");
+      workspace.style.removeProperty("--workspace-top");
+    };
+  }, [compact]);
+  useLayoutEffect(() => {
+    followMessages.current = true;
+  }, [chat.conversationId, tab]);
+  useLayoutEffect(() => {
+    const transcript = transcriptRef.current;
+    if (transcript && followMessages.current)
+      transcript.scrollTop = transcript.scrollHeight;
+  }, [chat.messages, chat.activeToolCalls, chat.conversationId, tab]);
+  useLayoutEffect(() => {
+    const input = composerRef.current;
+    if (!input) return;
+    input.style.height = "auto";
+    input.style.height = `${input.scrollHeight + 2}px`;
+    const transcript = transcriptRef.current;
+    if (transcript && followMessages.current)
+      transcript.scrollTop = transcript.scrollHeight;
+  }, [draft, tab]);
+  function newConversation() {
+    chat.newConversation();
+    setTab("chat");
+    setMenuOpen(false);
+  }
   const busy = chat.isLoading || chat.isStreaming;
   async function send(event: FormEvent) {
     event.preventDefault();
     if (!draft.trim() || busy) return;
     const content = draft;
+    followMessages.current = true;
     setDraft("");
     setActionError("");
     try {
@@ -126,85 +243,132 @@ function Workspace({ token, signOut }: { token: string; signOut: () => void }) {
         { expectedConversationId: conversationId },
       );
   }
-  return (
-    <div className="workspace">
-      <aside className="sidebar">
-        <h1>
+  const navigation = (
+    <aside className="sidebar" aria-label="Workspace navigation">
+      <div className="sidebar-heading">
+        <h1 id="navigation-title">
           <span className="brand-mark small">D</span> DurableClaw
         </h1>
-        <button
-          className="primary"
-          onClick={() => {
-            chat.newConversation();
-            setTab("chat");
-          }}
-        >
-          New conversation
-        </button>
-        <nav aria-label="Workspace sections">
-          {(["chat", "settings", "memory", "activity"] as Tab[]).map(
-            (value) => (
-              <button
-                className={tab === value ? "selected" : ""}
-                key={value}
-                onClick={() => setTab(value)}
-              >
-                {value === "chat"
-                  ? "Conversations"
-                  : value[0].toUpperCase() + value.slice(1)}
-              </button>
-            ),
-          )}
-        </nav>
-        <div className="conversation-list">
-          {chat.conversations.map((conversation) => (
-            <div className="conversation-row" key={conversation.id}>
-              <button
-                className={
-                  conversation.id === chat.conversationId ? "selected" : ""
-                }
-                onClick={() => {
-                  setTab("chat");
-                  void chat
-                    .switchConversation(conversation)
-                    .catch((error) => setActionError(errorText(error)));
-                }}
-              >
-                {conversation.title || "Untitled conversation"}
-              </button>
-              <button
-                className="icon-button"
-                aria-label={`Delete ${conversation.title || "conversation"}`}
-                onClick={() => setDeleting(conversation.id)}
-              >
-                ×
-              </button>
-            </div>
-          ))}
-          {chat.hasMoreConversations && (
+        {compact && (
+          <button
+            className="icon-button"
+            aria-label="Close navigation"
+            onClick={() => setMenuOpen(false)}
+          >
+            <span aria-hidden="true">×</span>
+          </button>
+        )}
+      </div>
+      <button className="primary" onClick={newConversation}>
+        New conversation
+      </button>
+      <nav aria-label="Workspace sections">
+        {(["chat", "settings", "memory", "activity"] as Tab[]).map((value) => (
+          <button
+            className={tab === value ? "selected" : ""}
+            aria-current={tab === value ? "page" : undefined}
+            key={value}
+            onClick={() => {
+              setTab(value);
+              setMenuOpen(false);
+            }}
+          >
+            {value === "chat"
+              ? "Conversations"
+              : value[0].toUpperCase() + value.slice(1)}
+          </button>
+        ))}
+      </nav>
+      <div className="conversation-list">
+        <h2 className="conversation-list-heading">Recent conversations</h2>
+        {chat.conversations.map((conversation) => (
+          <div className="conversation-row" key={conversation.id}>
             <button
-              disabled={chat.isLoadingConversations}
-              onClick={() =>
-                void chat
-                  .loadMoreConversations()
-                  .catch((error) => setActionError(errorText(error)))
+              className={
+                conversation.id === chat.conversationId ? "selected" : ""
               }
+              onClick={() => {
+                setTab("chat");
+                setMenuOpen(false);
+                void chat
+                  .switchConversation(conversation)
+                  .catch((error) => setActionError(errorText(error)));
+              }}
             >
-              Load older conversations
+              {conversation.title || "Untitled conversation"}
             </button>
-          )}
-        </div>
-        <button
-          onClick={() => {
-            chat.reset();
-            signOut();
-          }}
-        >
-          Sign out
-        </button>
-      </aside>
+            <button
+              className="icon-button"
+              aria-label={`Delete ${conversation.title || "conversation"}`}
+              onClick={() => {
+                setMenuOpen(false);
+                setDeleting(conversation.id);
+              }}
+            >
+              ×
+            </button>
+          </div>
+        ))}
+        {chat.hasMoreConversations && (
+          <button
+            disabled={chat.isLoadingConversations}
+            onClick={() =>
+              void chat
+                .loadMoreConversations()
+                .catch((error) => setActionError(errorText(error)))
+            }
+          >
+            Load older conversations
+          </button>
+        )}
+      </div>
+      <button
+        onClick={() => {
+          chat.reset();
+          signOut();
+        }}
+      >
+        Sign out
+      </button>
+    </aside>
+  );
+  return (
+    <div className="workspace" ref={workspaceRef}>
+      {compact
+        ? menuOpen && (
+            <Modal
+              className="navigation-drawer"
+              labelledBy="navigation-title"
+              onClose={() => setMenuOpen(false)}
+            >
+              {navigation}
+            </Modal>
+          )
+        : navigation}
       <main className="main-panel">
         <header className="panel-header">
+          {compact && (
+            <button
+              className="icon-button"
+              aria-label="Open navigation"
+              aria-haspopup="dialog"
+              aria-expanded={menuOpen}
+              onClick={() => setMenuOpen(true)}
+            >
+              <svg
+                width="22"
+                height="22"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.8"
+                strokeLinecap="round"
+                aria-hidden="true"
+              >
+                <path d="M4 6h16M4 12h16M4 18h16" />
+              </svg>
+            </button>
+          )}
           <h2>
             {tab === "chat"
               ? "Conversation"
@@ -217,6 +381,26 @@ function Workspace({ token, signOut }: { token: string; signOut: () => void }) {
                 ? "Connected"
                 : "Offline"}
           </span>
+          {compact && (
+            <button
+              className="icon-button"
+              aria-label="New conversation"
+              onClick={newConversation}
+            >
+              <svg
+                width="22"
+                height="22"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.8"
+                strokeLinecap="round"
+                aria-hidden="true"
+              >
+                <path d="M12 5v14M5 12h14" />
+              </svg>
+            </button>
+          )}
         </header>
         {(actionError || chat.error) && (
           <p role="alert" className="error banner">
@@ -225,7 +409,19 @@ function Workspace({ token, signOut }: { token: string; signOut: () => void }) {
         )}
         {tab === "chat" ? (
           <>
-            <div className="transcript" aria-live="polite">
+            <div
+              className="transcript"
+              aria-live="polite"
+              ref={transcriptRef}
+              onScroll={(event) => {
+                const transcript = event.currentTarget;
+                followMessages.current =
+                  transcript.scrollHeight -
+                    transcript.scrollTop -
+                    transcript.clientHeight <
+                  80;
+              }}
+            >
               {chat.staleConversation && (
                 <div className="notice">
                   Your previous conversation is available.{" "}
@@ -292,7 +488,6 @@ function Workspace({ token, signOut }: { token: string; signOut: () => void }) {
                   <button onClick={chat.cancelResearch}>Stop research</button>
                 </div>
               )}
-              <div ref={endRef} />
             </div>
             <form className="composer" onSubmit={send}>
               <label className="sr-only" htmlFor="message">
@@ -300,14 +495,16 @@ function Workspace({ token, signOut }: { token: string; signOut: () => void }) {
               </label>
               <textarea
                 id="message"
+                ref={composerRef}
                 placeholder="Ask DurableClaw…"
                 value={draft}
-                rows={3}
+                rows={1}
                 onChange={(event) => setDraft(event.target.value)}
                 onKeyDown={(event) => {
                   if (
                     event.key === "Enter" &&
                     !event.shiftKey &&
+                    !window.matchMedia("(pointer: coarse)").matches &&
                     !event.nativeEvent.isComposing
                   ) {
                     event.preventDefault();
@@ -316,7 +513,9 @@ function Workspace({ token, signOut }: { token: string; signOut: () => void }) {
                 }}
               />
               <div className="composer-actions">
-                <span className="muted">Shift + Enter for a new line</span>
+                <span className="muted keyboard-hint">
+                  Shift + Enter for a new line
+                </span>
                 {busy ? (
                   <button type="button" onClick={chat.cancel}>
                     Stop
@@ -338,38 +537,29 @@ function Workspace({ token, signOut }: { token: string; signOut: () => void }) {
         )}
       </main>
       {deleting && (
-        <div className="modal-backdrop">
-          <section
-            className="modal"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="delete-title"
-          >
-            <h3 id="delete-title">Delete conversation?</h3>
-            <p>
-              This removes its transcript and stops its research. Memories can
-              be managed separately.
-            </p>
-            <div className="button-row">
-              <button onClick={() => setDeleting(null)}>
-                Keep conversation
-              </button>
-              <button
-                className="danger"
-                onClick={async () => {
-                  try {
-                    await chat.deleteConversation(deleting);
-                    setDeleting(null);
-                  } catch (error) {
-                    setActionError(errorText(error));
-                  }
-                }}
-              >
-                Delete conversation
-              </button>
-            </div>
-          </section>
-        </div>
+        <Modal labelledBy="delete-title" onClose={() => setDeleting(null)}>
+          <h3 id="delete-title">Delete conversation?</h3>
+          <p>
+            This removes its transcript and stops its research. Memories can be
+            managed separately.
+          </p>
+          <div className="button-row">
+            <button onClick={() => setDeleting(null)}>Keep conversation</button>
+            <button
+              className="danger"
+              onClick={async () => {
+                try {
+                  await chat.deleteConversation(deleting);
+                  setDeleting(null);
+                } catch (error) {
+                  setActionError(errorText(error));
+                }
+              }}
+            >
+              Delete conversation
+            </button>
+          </div>
+        </Modal>
       )}
     </div>
   );
